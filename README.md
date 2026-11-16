@@ -22,6 +22,12 @@ cargo test
 | `verify` | check a recorded day for continuity and consistency       | not implemented |
 | `bench`  | performance experiments on a recorded day                 | not implemented |
 
+## What is implemented
+
+| Part | Where | Checked by |
+|------|-------|------------|
+| Decimal strings to integer steps, no floating point, no allocation | `src/decimal.rs` | unit tests and property tests |
+
 ## License
 
 MIT

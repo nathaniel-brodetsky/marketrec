@@ -13,3 +13,6 @@ clap = { version = "4", features = ["derive"] }
 
 [profile.release]
 debug = 1
+
+[dev-dependencies]
+proptest = "1"
