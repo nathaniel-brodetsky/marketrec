@@ -5,3 +5,4 @@ pub mod cli;
 pub mod decimal;
 pub mod event;
 pub mod json;
+pub mod sync;

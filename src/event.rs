@@ -57,3 +57,11 @@ pub enum Event<'a> {
     Trade(Trade),
     ServerShutdown(ServerShutdown),
 }
+
+/// Full order book from the REST depth endpoint, valid as of `last_update_id`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Snapshot {
+    pub last_update_id: u64,
+    pub bids: Vec<Level>,
+    pub asks: Vec<Level>,
+}

@@ -29,6 +29,7 @@ cargo test
 | Decimal strings to integer steps, no floating point, no allocation | `src/decimal.rs` | unit tests and property tests |
 | Decoder for the JSON combined stream: depth diffs, best bid and ask, trades, server shutdown notices | `src/json.rs` | unit tests on sample frames, property tests on random and truncated input |
 | Reference order book (`BTreeMap`), invariants: positive prices, non-negative quantities, book not crossed | `src/book/` | unit tests, property test against a hash-map model |
+| Book synchronization (snapshot plus diffs) as Binance documents it: stale snapshots, gaps, duplicates, out-of-order diffs, reconnects | `src/sync.rs` | unit test per case; property test with dropped, duplicated and reordered diffs: a synced book always equals the exchange book |
 
 ## License
 
