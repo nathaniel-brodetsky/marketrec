@@ -163,6 +163,18 @@ impl<B: OrderBook> BookSync<B> {
         });
     }
 
+    /// The snapshot for request `id` could not be fetched or decoded: ask again if diffs are
+    /// waiting, otherwise the next diff asks.
+    pub fn on_snapshot_failed(&mut self, id: u64, out: &mut Vec<Action>) {
+        if self.awaiting != Some(id) {
+            return;
+        }
+        self.awaiting = None;
+        if !self.buffer.is_empty() {
+            self.request(out);
+        }
+    }
+
     /// The connection was lost: everything is rebuilt from the next diff.
     pub fn on_reconnect(&mut self, out: &mut Vec<Action>) {
         out.push(Action::Quality(Quality::Reconnect));
@@ -454,6 +466,25 @@ mod tests {
         s.on_snapshot(old, &snapshot(100), &mut out);
         assert_eq!(s.state(), State::Resyncing);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn failed_snapshot_is_requested_again() {
+        let mut s = new_sync();
+        let mut out = Vec::new();
+        s.on_diff(&diff(100, 101, &[], &[]), &mut out);
+        let first = requested(&out).unwrap();
+        out.clear();
+        s.on_snapshot_failed(first + 5, &mut out);
+        assert!(
+            out.is_empty(),
+            "a failure for another request changes nothing"
+        );
+        s.on_snapshot_failed(first, &mut out);
+        let second = requested(&out).expect("must ask again");
+        out.clear();
+        s.on_snapshot(second, &snapshot(100), &mut out);
+        assert_eq!(s.state(), State::Synced);
     }
 
     #[test]

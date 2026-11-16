@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
 use crate::decimal::{Grid, ParseError};
-use crate::event::{BookTicker, DepthDiff, Event, Level, ServerShutdown, Trade};
+use crate::event::{BookTicker, DepthDiff, Event, Level, ServerShutdown, Snapshot, Trade};
 
 /// Unit of the time fields in the feed: milliseconds by default, microseconds when the
 /// stream URL has `timeUnit=MICROSECOND`.
@@ -143,6 +143,16 @@ struct ShutdownRaw {
     shutdown_time: u64,
 }
 
+#[derive(Deserialize)]
+struct SnapshotRaw<'a> {
+    #[serde(rename = "lastUpdateId")]
+    last_update_id: u64,
+    #[serde(borrow)]
+    bids: Vec<[&'a str; 2]>,
+    #[serde(borrow)]
+    asks: Vec<[&'a str; 2]>,
+}
+
 /// Decoder for one symbol. Reuse one decoder for the whole stream: its depth buffers keep
 /// their capacity between messages.
 pub struct JsonDecoder {
@@ -218,6 +228,18 @@ impl JsonDecoder {
             }
             _ => Err(DecodeError::UnknownStream),
         }
+    }
+
+    /// Decode the body of a REST depth snapshot: `{"lastUpdateId":..,"bids":[..],"asks":[..]}`.
+    pub fn decode_snapshot(&self, body: &[u8]) -> Result<Snapshot, DecodeError> {
+        let raw: SnapshotRaw<'_> = serde_json::from_slice(body)?;
+        let mut snap = Snapshot {
+            last_update_id: raw.last_update_id,
+            ..Snapshot::default()
+        };
+        fill_levels(&mut snap.bids, &raw.bids, self.price, self.qty)?;
+        fill_levels(&mut snap.asks, &raw.asks, self.price, self.qty)?;
+        Ok(snap)
     }
 
     fn ns(&self, value: u64) -> Result<i64, DecodeError> {
@@ -422,6 +444,39 @@ mod tests {
             d.decode(huge_time.as_bytes()),
             Err(DecodeError::TimeOverflow)
         ));
+    }
+
+    #[test]
+    fn snapshot() {
+        let d = decoder(TimeUnit::Milli);
+        let body = br#"{"lastUpdateId":1027024,"bids":[["97123.45000000","0.00120000"]],"asks":[["97123.46000000","1.50000000"],["97123.50000000","0.00001000"]]}"#;
+        let s = d.decode_snapshot(body).unwrap();
+        assert_eq!(s.last_update_id, 1_027_024);
+        assert_eq!(
+            s.bids,
+            vec![Level {
+                price: 9_712_345,
+                qty: 120
+            }]
+        );
+        assert_eq!(
+            s.asks,
+            vec![
+                Level {
+                    price: 9_712_346,
+                    qty: 150_000
+                },
+                Level {
+                    price: 9_712_350,
+                    qty: 1
+                }
+            ]
+        );
+        assert!(matches!(
+            d.decode_snapshot(b"{\"code\":-1003,\"msg\":\"Too many requests\"}"),
+            Err(DecodeError::Json(_))
+        ));
+        assert!(matches!(d.decode_snapshot(b""), Err(DecodeError::Json(_))));
     }
 
     proptest! {
