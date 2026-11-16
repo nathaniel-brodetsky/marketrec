@@ -4,5 +4,6 @@ pub mod book;
 pub mod cli;
 pub mod decimal;
 pub mod event;
+pub mod frames;
 pub mod json;
 pub mod sync;

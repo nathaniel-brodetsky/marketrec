@@ -1,5 +1,8 @@
 //! Command line interface. Every command is declared here; implementations arrive stage by stage.
 
+use std::fmt;
+use std::fs::File;
+use std::io::{self, BufReader, BufWriter, Write};
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -47,6 +50,30 @@ pub enum Command {
         #[arg(long)]
         day: PathBuf,
     },
+    /// Convert frames files between the binary form and readable JSON Lines.
+    Frames {
+        #[command(subcommand)]
+        action: FramesAction,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum FramesAction {
+    /// Binary frames to JSON Lines.
+    Dump {
+        #[arg(long)]
+        input: PathBuf,
+        /// Output file; standard output if omitted.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// JSON Lines to binary frames. The output must not exist yet.
+    Pack {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -59,26 +86,76 @@ pub enum Protocol {
     Both,
 }
 
-/// Error returned by a command that is declared but not built yet.
-#[derive(Debug, PartialEq, Eq)]
-pub struct NotImplemented(pub &'static str);
+#[derive(Debug)]
+pub enum CliError {
+    /// The command is declared but not built yet.
+    NotImplemented(&'static str),
+    Io(io::Error),
+    Text(crate::frames::text::TextError),
+}
 
-impl std::fmt::Display for NotImplemented {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "`{}` is not implemented yet", self.0)
+impl fmt::Display for CliError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CliError::NotImplemented(cmd) => write!(f, "`{cmd}` is not implemented yet"),
+            CliError::Io(e) => write!(f, "{e}"),
+            CliError::Text(e) => write!(f, "{e}"),
+        }
     }
 }
 
-impl std::error::Error for NotImplemented {}
+impl std::error::Error for CliError {}
 
-/// Run one command.
-pub fn run(command: Command) -> Result<(), NotImplemented> {
-    match command {
-        Command::Record { .. } => Err(NotImplemented("record")),
-        Command::Replay { .. } => Err(NotImplemented("replay")),
-        Command::Verify { .. } => Err(NotImplemented("verify")),
-        Command::Bench { .. } => Err(NotImplemented("bench")),
+impl From<io::Error> for CliError {
+    fn from(e: io::Error) -> Self {
+        CliError::Io(e)
     }
+}
+
+impl From<crate::frames::text::TextError> for CliError {
+    fn from(e: crate::frames::text::TextError) -> Self {
+        CliError::Text(e)
+    }
+}
+
+/// Run one command. Progress and summaries go to standard error.
+pub fn run(command: Command) -> Result<(), CliError> {
+    match command {
+        Command::Record { .. } => Err(CliError::NotImplemented("record")),
+        Command::Replay { .. } => Err(CliError::NotImplemented("replay")),
+        Command::Verify { .. } => Err(CliError::NotImplemented("verify")),
+        Command::Bench { .. } => Err(CliError::NotImplemented("bench")),
+        Command::Frames { action } => run_frames(action),
+    }
+}
+
+fn run_frames(action: FramesAction) -> Result<(), CliError> {
+    use crate::frames::text;
+    match action {
+        FramesAction::Dump { input, output } => {
+            let src = BufReader::new(File::open(&input)?);
+            let n = match output {
+                Some(path) => {
+                    let mut out = BufWriter::new(File::create_new(&path)?);
+                    let n = text::dump(src, &mut out)?;
+                    out.flush()?;
+                    n
+                }
+                None => {
+                    let mut out = BufWriter::new(io::stdout().lock());
+                    let n = text::dump(src, &mut out)?;
+                    out.flush()?;
+                    n
+                }
+            };
+            eprintln!("{n} records");
+        }
+        FramesAction::Pack { input, output } => {
+            let n = text::pack_file(BufReader::new(File::open(&input)?), &output)?;
+            eprintln!("{n} records written to {}", output.display());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -155,5 +232,67 @@ mod tests {
     fn stubs_say_what_is_missing() {
         let err = run(parse(&["marketrec", "replay", "--input", "x.frames"])).unwrap_err();
         assert_eq!(err.to_string(), "`replay` is not implemented yet");
+    }
+
+    #[test]
+    fn frames_pack_then_dump() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = dir.path().join("in.jsonl");
+        let bin = dir.path().join("in.frames");
+        let back = dir.path().join("back.jsonl");
+        let content = concat!(
+            r#"{"header":{"symbol":"BTCUSDT","price_step":"0.01000000","qty_step":"0.00001000","time_unit":"milli","recorder":"t"}}"#,
+            "\n",
+            r#"{"kind":"text","recv_ts":1,"aux":1,"payload":"{}"}"#,
+            "\n",
+        );
+        std::fs::write(&text, content).unwrap();
+        let path = |p: &std::path::Path| p.to_str().unwrap().to_owned();
+        run(parse(&[
+            "marketrec",
+            "frames",
+            "pack",
+            "--input",
+            &path(&text),
+            "--output",
+            &path(&bin),
+        ]))
+        .unwrap();
+        run(parse(&[
+            "marketrec",
+            "frames",
+            "dump",
+            "--input",
+            &path(&bin),
+            "--output",
+            &path(&back),
+        ]))
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&back).unwrap(), content);
+        // outputs are never overwritten
+        assert!(
+            run(parse(&[
+                "marketrec",
+                "frames",
+                "pack",
+                "--input",
+                &path(&text),
+                "--output",
+                &path(&bin)
+            ]))
+            .is_err()
+        );
+        assert!(
+            run(parse(&[
+                "marketrec",
+                "frames",
+                "dump",
+                "--input",
+                &path(&bin),
+                "--output",
+                &path(&back)
+            ]))
+            .is_err()
+        );
     }
 }

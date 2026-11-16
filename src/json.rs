@@ -15,7 +15,7 @@
 
 use std::fmt;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
 use crate::decimal::{Grid, ParseError};
@@ -23,7 +23,8 @@ use crate::event::{BookTicker, DepthDiff, Event, Level, ServerShutdown, Trade};
 
 /// Unit of the time fields in the feed: milliseconds by default, microseconds when the
 /// stream URL has `timeUnit=MICROSECOND`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum TimeUnit {
     Milli,
     Micro,

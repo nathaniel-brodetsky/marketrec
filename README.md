@@ -21,6 +21,7 @@ cargo test
 | `replay` | feed recorded frames through the hot path, no network  | not implemented |
 | `verify` | check a recorded day for continuity and consistency       | not implemented |
 | `bench`  | performance experiments on a recorded day                 | not implemented |
+| `frames dump`, `frames pack` | convert frames files to readable JSON Lines and back | implemented |
 
 ## What is implemented
 
@@ -30,6 +31,7 @@ cargo test
 | Decoder for the JSON combined stream: depth diffs, best bid and ask, trades, server shutdown notices | `src/json.rs` | unit tests on sample frames, property tests on random and truncated input |
 | Reference order book (`BTreeMap`), invariants: positive prices, non-negative quantities, book not crossed | `src/book/` | unit tests, property test against a hash-map model |
 | Book synchronization (snapshot plus diffs) as Binance documents it: stale snapshots, gaps, duplicates, out-of-order diffs, reconnects | `src/sync.rs` | unit test per case; property test with dropped, duplicated and reordered diffs: a synced book always equals the exchange book |
+| Frames file: raw hot-path input (messages, snapshots, connection events) with receive times; CRC-32 per record, atomic write, specified in `docs/FRAMES.md` | `src/frames/` | round trips, every truncation point, random bit flips are always detected |
 
 ## License
 
