@@ -1,0 +1,15 @@
+[package]
+name = "marketrec"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "Market-data recorder for Binance Spot with order book sync and gap detection"
+license = "MIT"
+repository = "https://github.com/nathaniel-brodetsky/marketrec"
+publish = false
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+debug = 1
