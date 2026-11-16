@@ -27,6 +27,7 @@ cargo test
 | Part | Where | Checked by |
 |------|-------|------------|
 | Decimal strings to integer steps, no floating point, no allocation | `src/decimal.rs` | unit tests and property tests |
+| Decoder for the JSON combined stream: depth diffs, best bid and ask, trades, server shutdown notices | `src/json.rs` | unit tests on sample frames, property tests on random and truncated input |
 
 ## License
 
