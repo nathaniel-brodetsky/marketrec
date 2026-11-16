@@ -54,6 +54,26 @@ pub enum Command {
         #[arg(long)]
         day: PathBuf,
     },
+    /// Show the trading rules Binance publishes for a symbol. Uses the network.
+    Info {
+        #[arg(long)]
+        symbol: String,
+        #[arg(long, default_value = crate::net::rest::DEFAULT_BASE)]
+        rest_url: String,
+    },
+    /// Fetch a depth snapshot and print its best levels. Uses the network.
+    Snapshot {
+        #[arg(long)]
+        symbol: String,
+        /// Levels to print on each side.
+        #[arg(long, default_value_t = 5)]
+        levels: usize,
+        /// Levels to request on each side (Binance weight: 250 for 1001-5000).
+        #[arg(long, default_value_t = 5000)]
+        limit: u32,
+        #[arg(long, default_value = crate::net::rest::DEFAULT_BASE)]
+        rest_url: String,
+    },
     /// Convert frames files between the binary form and readable JSON Lines.
     Frames {
         #[command(subcommand)]
@@ -97,6 +117,8 @@ pub enum CliError {
     Io(io::Error),
     Text(crate::frames::text::TextError),
     Replay(crate::replay::ReplayError),
+    Rest(crate::net::rest::RestError),
+    Decode(crate::json::DecodeError),
     /// The input contains a damaged record; everything before it was processed.
     Damaged,
 }
@@ -108,6 +130,8 @@ impl fmt::Display for CliError {
             CliError::Io(e) => write!(f, "{e}"),
             CliError::Text(e) => write!(f, "{e}"),
             CliError::Replay(e) => write!(f, "{e}"),
+            CliError::Rest(e) => write!(f, "{e}"),
+            CliError::Decode(e) => write!(f, "{e}"),
             CliError::Damaged => write!(f, "the input contains a damaged record"),
         }
     }
@@ -135,7 +159,105 @@ pub fn run(command: Command) -> Result<(), CliError> {
         Command::Verify { .. } => Err(CliError::NotImplemented("verify")),
         Command::Bench { .. } => Err(CliError::NotImplemented("bench")),
         Command::Frames { action } => run_frames(action),
+        Command::Info { symbol, rest_url } => {
+            let info = block_on(rest(&rest_url)?.symbol_info(&symbol))?;
+            println!(
+                "{} {}: tick size {}, step size {}",
+                info.symbol, info.status, info.tick_size, info.step_size
+            );
+            Ok(())
+        }
+        Command::Snapshot {
+            symbol,
+            levels,
+            limit,
+            rest_url,
+        } => {
+            print!("{}", snapshot_report(&rest_url, &symbol, limit, levels)?);
+            Ok(())
+        }
     }
+}
+
+fn block_on<T>(
+    fut: impl std::future::Future<Output = Result<T, crate::net::rest::RestError>>,
+) -> Result<T, CliError> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(fut).map_err(CliError::Rest)
+}
+
+fn rest(base: &str) -> Result<crate::net::rest::Rest, CliError> {
+    crate::net::rest::Rest::new(base, std::time::Duration::from_secs(10)).map_err(CliError::Rest)
+}
+
+/// Rules of the symbol, then a snapshot decoded with them: checks the whole read path on
+/// live data.
+fn snapshot_report(
+    rest_url: &str,
+    symbol: &str,
+    limit: u32,
+    levels: usize,
+) -> Result<String, CliError> {
+    use std::fmt::Write as _;
+
+    use crate::decimal::Grid;
+    use crate::json::{JsonDecoder, TimeUnit};
+    use crate::replay::decimal;
+
+    let client = rest(rest_url)?;
+    let info = block_on(client.symbol_info(symbol))?;
+    let started = std::time::Instant::now();
+    let fetched = block_on(client.depth(symbol, limit))?;
+    let elapsed = started.elapsed();
+    let grid = |s: &str| {
+        Grid::parse(s.as_bytes()).map_err(|err| {
+            CliError::Decode(crate::json::DecodeError::Number {
+                field: "filter",
+                err,
+            })
+        })
+    };
+    let (price, qty) = (grid(&info.tick_size)?, grid(&info.step_size)?);
+    let snap = JsonDecoder::new(symbol, price, qty, TimeUnit::Milli)
+        .decode_snapshot(&fetched.body)
+        .map_err(CliError::Decode)?;
+    let mut out = String::new();
+    let weight = fetched
+        .used_weight_1m
+        .map_or("unknown".to_owned(), |w| w.to_string());
+    let _ = writeln!(
+        out,
+        "{} {}: tick size {}, step size {}",
+        info.symbol, info.status, info.tick_size, info.step_size
+    );
+    let _ = writeln!(
+        out,
+        "snapshot at update {}: {} bids, {} asks, fetched in {} ms, IP weight used this minute {weight}",
+        snap.last_update_id,
+        snap.bids.len(),
+        snap.asks.len(),
+        elapsed.as_millis()
+    );
+    let n = levels.min(snap.asks.len());
+    for l in snap.asks[..n].iter().rev() {
+        let _ = writeln!(
+            out,
+            "  ask {:>20}  {:>16}",
+            decimal(l.price, price),
+            decimal(l.qty, qty)
+        );
+    }
+    for l in snap.bids.iter().take(levels) {
+        let _ = writeln!(
+            out,
+            "  bid {:>20}  {:>16}",
+            decimal(l.price, price),
+            decimal(l.qty, qty)
+        );
+    }
+    Ok(out)
 }
 
 fn run_replay(input: &std::path::Path, events: bool) -> Result<(), CliError> {
@@ -257,6 +379,46 @@ mod tests {
     fn stubs_say_what_is_missing() {
         let err = run(parse(&["marketrec", "verify", "--day", "x"])).unwrap_err();
         assert_eq!(err.to_string(), "`verify` is not implemented yet");
+    }
+
+    #[test]
+    fn snapshot_command_reads_rules_then_decodes_the_snapshot_with_them() {
+        use crate::net::rest::tests::{EXCHANGE_INFO, mock_http_thread};
+        let depth = r#"{"lastUpdateId":77,"bids":[["97123.45000000","0.25000000"],["97123.44000000","0.50000000"]],"asks":[["97123.46000000","0.30000000"],["97123.47000000","0.80000000"]]}"#;
+        let base = mock_http_thread(vec![
+            ("/api/v3/exchangeInfo", "200 OK", "", EXCHANGE_INFO),
+            (
+                "/api/v3/depth",
+                "200 OK",
+                "x-mbx-used-weight-1m: 270\r\n",
+                depth,
+            ),
+        ]);
+        let out = snapshot_report(&base, "BTCUSDT", 5000, 1).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines[0],
+            "BTCUSDT TRADING: tick size 0.01000000, step size 0.00001000"
+        );
+        assert!(lines[1].starts_with("snapshot at update 77: 2 bids, 2 asks, fetched in "));
+        assert!(lines[1].ends_with("IP weight used this minute 270"));
+        assert_eq!(lines[2], "  ask       97123.46000000        0.30000000");
+        assert_eq!(lines[3], "  bid       97123.45000000        0.25000000");
+        assert_eq!(lines.len(), 4);
+        // an off-grid price in the snapshot is caught by the decoder
+        let bad = mock_http_thread(vec![
+            ("/api/v3/exchangeInfo", "200 OK", "", EXCHANGE_INFO),
+            (
+                "/api/v3/depth",
+                "200 OK",
+                "",
+                r#"{"lastUpdateId":1,"bids":[["97123.455","1"]],"asks":[]}"#,
+            ),
+        ]);
+        assert!(matches!(
+            snapshot_report(&bad, "BTCUSDT", 5, 1),
+            Err(CliError::Decode(_))
+        ));
     }
 
     #[test]

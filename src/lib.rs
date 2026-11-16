@@ -6,6 +6,7 @@ pub mod decimal;
 pub mod event;
 pub mod frames;
 pub mod json;
+pub mod net;
 pub mod pipeline;
 pub mod replay;
 pub mod sync;

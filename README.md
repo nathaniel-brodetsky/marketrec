@@ -47,6 +47,8 @@ end           clean
 |---------|---------|-------|
 | `replay` | feed recorded frames through the live code without network; summary and quality events | implemented |
 | `frames dump`, `frames pack` | convert frames files to readable JSON Lines and back | implemented |
+| `info` | trading rules of a symbol from Binance (tick size, step size, status) | implemented |
+| `snapshot` | fetch a depth snapshot and print its best levels, decoded with the symbol's rules | implemented |
 | `record` | record a symbol from Binance | not yet |
 | `verify` | check a recorded day for continuity and consistency | not yet |
 | `bench` | performance experiments on a recorded day | not yet |
@@ -62,6 +64,7 @@ end           clean
 | Frames file: raw hot-path input (messages, snapshots, connection events) with receive times; CRC-32 per record, atomic write, specified in `docs/FRAMES.md` | `src/frames/` | round trips, every truncation point, random bit flips are always detected |
 | Decoding pipeline: frames to events, book sync, cross-check of the book against the exchange's best bid and ask at equal update IDs, counters including time with a valid book | `src/pipeline.rs` | scenario tests per case, determinism test, random frames never panic |
 | Replay of recorded frames through the live code, with a summary and the quality events; truncated files replay up to the cut, damaged ones stop at the damage | `src/replay.rs` | one integration test per scenario in `tests/fixtures`; text and binary forms give identical results |
+| REST client for symbol rules and depth snapshots: timeouts, HTTP errors with the exchange's message, `Retry-After` on 429 and 418, used IP weight; bodies kept verbatim for recording | `src/net/rest.rs` | tests against a local HTTP server: success, invalid symbol, rate limit, missing filter, timeout, refused connection |
 
 ## License
 
