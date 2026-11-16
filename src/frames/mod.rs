@@ -47,6 +47,17 @@ pub enum FrameKind {
 }
 
 impl FrameKind {
+    /// The name used in the text form.
+    pub fn name(self) -> &'static str {
+        match self {
+            FrameKind::Text => "text",
+            FrameKind::Binary => "binary",
+            FrameKind::Snapshot => "snapshot",
+            FrameKind::Connected => "connected",
+            FrameKind::Disconnected => "disconnected",
+        }
+    }
+
     pub fn from_u8(v: u8) -> Option<Self> {
         Some(match v {
             1 => FrameKind::Text,

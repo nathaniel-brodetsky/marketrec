@@ -32,11 +32,15 @@ pub enum Command {
         #[arg(long, default_value = "data")]
         out: PathBuf,
     },
-    /// Feed recorded frames through the same hot path as the live feed, without network.
+    /// Feed recorded frames through the same hot path as the live feed, without network,
+    /// and print a summary. Accepts binary frames files and their JSON Lines form.
     Replay {
         /// File with recorded frames.
         #[arg(long)]
         input: PathBuf,
+        /// Also print every quality event with its receive time.
+        #[arg(long)]
+        events: bool,
     },
     /// Check a recorded day: continuity, row counts against the manifest, book rebuild.
     Verify {
@@ -92,6 +96,9 @@ pub enum CliError {
     NotImplemented(&'static str),
     Io(io::Error),
     Text(crate::frames::text::TextError),
+    Replay(crate::replay::ReplayError),
+    /// The input contains a damaged record; everything before it was processed.
+    Damaged,
 }
 
 impl fmt::Display for CliError {
@@ -100,6 +107,8 @@ impl fmt::Display for CliError {
             CliError::NotImplemented(cmd) => write!(f, "`{cmd}` is not implemented yet"),
             CliError::Io(e) => write!(f, "{e}"),
             CliError::Text(e) => write!(f, "{e}"),
+            CliError::Replay(e) => write!(f, "{e}"),
+            CliError::Damaged => write!(f, "the input contains a damaged record"),
         }
     }
 }
@@ -122,10 +131,26 @@ impl From<crate::frames::text::TextError> for CliError {
 pub fn run(command: Command) -> Result<(), CliError> {
     match command {
         Command::Record { .. } => Err(CliError::NotImplemented("record")),
-        Command::Replay { .. } => Err(CliError::NotImplemented("replay")),
+        Command::Replay { input, events } => run_replay(&input, events),
         Command::Verify { .. } => Err(CliError::NotImplemented("verify")),
         Command::Bench { .. } => Err(CliError::NotImplemented("bench")),
         Command::Frames { action } => run_frames(action),
+    }
+}
+
+fn run_replay(input: &std::path::Path, events: bool) -> Result<(), CliError> {
+    let report = crate::replay::replay_file(input).map_err(CliError::Replay)?;
+    let mut out = io::stdout().lock();
+    if events {
+        for (ts, e) in &report.events {
+            writeln!(out, "{ts} {e}")?;
+        }
+        writeln!(out)?;
+    }
+    writeln!(out, "{report}")?;
+    match report.ending {
+        crate::replay::Ending::Corrupt { .. } => Err(CliError::Damaged),
+        _ => Ok(()),
     }
 }
 
@@ -230,8 +255,8 @@ mod tests {
 
     #[test]
     fn stubs_say_what_is_missing() {
-        let err = run(parse(&["marketrec", "replay", "--input", "x.frames"])).unwrap_err();
-        assert_eq!(err.to_string(), "`replay` is not implemented yet");
+        let err = run(parse(&["marketrec", "verify", "--day", "x"])).unwrap_err();
+        assert_eq!(err.to_string(), "`verify` is not implemented yet");
     }
 
     #[test]
@@ -243,7 +268,7 @@ mod tests {
         let content = concat!(
             r#"{"header":{"symbol":"BTCUSDT","price_step":"0.01000000","qty_step":"0.00001000","time_unit":"milli","recorder":"t"}}"#,
             "\n",
-            r#"{"kind":"text","recv_ts":1,"aux":1,"payload":"{}"}"#,
+            r#"{"kind":"text","recv_ts":1,"aux":1,"payload_json":{}}"#,
             "\n",
         );
         std::fs::write(&text, content).unwrap();

@@ -52,4 +52,11 @@ version). Readers reject other format versions.
 
 `marketrec frames dump` and `marketrec frames pack` convert to and from JSON Lines
 without loss: a header line `{"header":{...}}`, then one object per record with `kind`,
-`recv_ts`, `aux` and `payload` (UTF-8) or `payload_hex`. Test fixtures use this form.
+`recv_ts`, `aux` and at most one payload field:
+
+- `payload_json`: a JSON object or array on one line, embedded verbatim;
+- `payload`: any other UTF-8 text, as a JSON string;
+- `payload_hex`: any other bytes;
+- no payload field: empty payload.
+
+Test fixtures use this form; `marketrec replay` reads both forms.

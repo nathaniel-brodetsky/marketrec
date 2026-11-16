@@ -3,20 +3,27 @@
 //! The first line is `{"header":{...}}`, every following line one record:
 //!
 //! ```text
-//! {"kind":"text","recv_ts":1763300000000000000,"aux":1,"payload":"{\"stream\":...}"}
-//! {"kind":"binary","recv_ts":1763300000000100000,"aux":2,"payload_hex":"00ff01"}
-//! {"kind":"disconnected","recv_ts":1763300000000200000,"aux":1}
+//! {"kind":"text","recv_ts":1795219200000000000,"aux":1,"payload_json":{"stream":"btcusdt@trade","data":{..}}}
+//! {"kind":"connected","recv_ts":1795219200000100000,"aux":1,"payload":"wss://stream.binance.com:9443/stream"}
+//! {"kind":"binary","recv_ts":1795219200000200000,"aux":2,"payload_hex":"00ff01"}
+//! {"kind":"disconnected","recv_ts":1795219200000300000,"aux":1}
 //! ```
 //!
-//! A payload that is valid UTF-8 is stored as `payload`, any other as `payload_hex`, an
-//! empty one is omitted. Conversion in both directions is lossless. Test fixtures are kept
-//! in this form so that a reviewer can read every scenario.
+//! The payload is written in the most readable form that keeps its exact bytes:
+//! - `payload_json`: a JSON object or array on one line, embedded verbatim (not re-encoded);
+//! - `payload`: any other UTF-8 text, as a JSON string;
+//! - `payload_hex`: anything else;
+//! - nothing: an empty payload.
+//!
+//! Conversion in both directions is lossless. Test fixtures are kept in this form so that a
+//! reviewer can read every scenario.
 
 use std::fmt;
 use std::io::{self, BufRead, Read, Write};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 
 use super::{FrameKind, FramesError, FramesFile, FramesReader, FramesWriter, Header, OwnedFrame};
 
@@ -33,6 +40,8 @@ struct Record {
     aux: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     payload: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    payload_json: Option<Box<RawValue>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     payload_hex: Option<String>,
 }
@@ -86,16 +95,22 @@ pub fn dump(input: impl Read, out: &mut impl Write) -> Result<usize, TextError> 
     out.write_all(b"\n")?;
     let mut n = 0;
     while let Some(f) = reader.next_frame()? {
-        let (payload, payload_hex) = match std::str::from_utf8(f.payload) {
-            _ if f.payload.is_empty() => (None, None),
-            Ok(s) => (Some(s.to_owned()), None),
-            Err(_) => (None, Some(to_hex(f.payload))),
-        };
+        let (mut payload, mut payload_json, mut payload_hex) = (None, None, None);
+        if !f.payload.is_empty() {
+            match std::str::from_utf8(f.payload) {
+                Ok(s) => match embeddable_json(s) {
+                    Some(raw) => payload_json = Some(raw),
+                    None => payload = Some(s.to_owned()),
+                },
+                Err(_) => payload_hex = Some(to_hex(f.payload)),
+            }
+        }
         let rec = Record {
             kind: f.kind,
             recv_ts: f.recv_ts,
             aux: f.aux,
             payload,
+            payload_json,
             payload_hex,
         };
         serde_json::to_writer(&mut *out, &rec).map_err(io::Error::from)?;
@@ -163,6 +178,37 @@ fn for_each_record<B: BufRead>(
     Ok(n)
 }
 
+/// Streams the records of a JSON Lines file.
+pub struct TextReader<B: BufRead> {
+    lines: Lines<B>,
+    header: Header,
+}
+
+impl<B: BufRead> TextReader<B> {
+    pub fn new(input: B) -> Result<Self, TextError> {
+        let mut lines = input.lines().enumerate();
+        let header = read_header(&mut lines)?;
+        Ok(Self { lines, header })
+    }
+
+    pub fn header(&self) -> &Header {
+        &self.header
+    }
+
+    pub fn next_frame(&mut self) -> Result<Option<OwnedFrame>, TextError> {
+        for (i, line) in self.lines.by_ref() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            return parse_record(&line)
+                .map(Some)
+                .map_err(|msg| TextError::Line { line: i + 1, msg });
+        }
+        Ok(None)
+    }
+}
+
 /// Read all records of a JSON Lines file, for tests and tools.
 pub fn read_all(input: impl BufRead) -> Result<(Header, Vec<OwnedFrame>), TextError> {
     let mut bytes = Vec::new();
@@ -178,11 +224,12 @@ pub fn read_all(input: impl BufRead) -> Result<(Header, Vec<OwnedFrame>), TextEr
 
 fn parse_record(line: &str) -> Result<OwnedFrame, String> {
     let rec: Record = serde_json::from_str(line).map_err(|e| e.to_string())?;
-    let payload = match (rec.payload, rec.payload_hex) {
-        (Some(_), Some(_)) => return Err("both payload and payload_hex".into()),
-        (Some(s), None) => s.into_bytes(),
-        (None, Some(h)) => from_hex(&h).ok_or("payload_hex is not valid hex")?,
-        (None, None) => Vec::new(),
+    let payload = match (rec.payload, rec.payload_json, rec.payload_hex) {
+        (Some(s), None, None) => s.into_bytes(),
+        (None, Some(j), None) => j.get().as_bytes().to_vec(),
+        (None, None, Some(h)) => from_hex(&h).ok_or("payload_hex is not valid hex")?,
+        (None, None, None) => Vec::new(),
+        _ => return Err("more than one of payload, payload_json, payload_hex".into()),
     };
     Ok(OwnedFrame {
         kind: rec.kind,
@@ -190,6 +237,19 @@ fn parse_record(line: &str) -> Result<OwnedFrame, String> {
         aux: rec.aux,
         payload,
     })
+}
+
+/// A payload that can be embedded as JSON without changing a byte: an object or array on
+/// one line, without surrounding whitespace.
+fn embeddable_json(s: &str) -> Option<Box<RawValue>> {
+    let shaped =
+        (s.starts_with('{') || s.starts_with('[')) && s.trim() == s && !s.contains(['\n', '\r']);
+    if !shaped {
+        return None;
+    }
+    RawValue::from_string(s.to_owned())
+        .ok()
+        .filter(|raw| raw.get() == s)
 }
 
 fn to_hex(bytes: &[u8]) -> String {
@@ -225,7 +285,7 @@ mod tests {
         "\n",
         r#"{"kind":"connected","recv_ts":10,"aux":1,"payload":"wss://example/stream"}"#,
         "\n",
-        r#"{"kind":"text","recv_ts":11,"aux":1,"payload":"{\"stream\":\"btcusdt@trade\"}"}"#,
+        r#"{"kind":"text","recv_ts":11,"aux":1,"payload_json":{"stream":"btcusdt@trade","data":{"p": [1, 2.50]}}}"#,
         "\n",
         r#"{"kind":"binary","recv_ts":12,"aux":2,"payload_hex":"00ff01"}"#,
         "\n",
@@ -310,10 +370,50 @@ mod tests {
         assert_eq!(String::from_utf8(text).unwrap(), TEXT);
     }
 
+    #[test]
+    fn payload_forms() {
+        assert!(
+            embeddable_json(r#"{"a": [1, 2]}"#).is_some(),
+            "inner whitespace is kept verbatim"
+        );
+        assert!(embeddable_json("[1,2]").is_some());
+        for not_embedded in [
+            r#""a string""#,
+            "123",
+            " {}",
+            "{} ",
+            "{\n}",
+            "{broken",
+            "plain text",
+        ] {
+            assert!(embeddable_json(not_embedded).is_none(), "{not_embedded:?}");
+        }
+        let two = TEXT.replace(
+            r#""payload":"wss://example/stream""#,
+            r#""payload":"x","payload_json":{}"#,
+        );
+        assert!(matches!(
+            pack(two.as_bytes(), Vec::new()),
+            Err(TextError::Line { line: 2, .. })
+        ));
+    }
+
     proptest! {
         #[test]
         fn hex_roundtrip(bytes in proptest::collection::vec(any::<u8>(), 0..64)) {
             prop_assert_eq!(from_hex(&to_hex(&bytes)), Some(bytes));
+        }
+
+        #[test]
+        fn json_like_payloads_roundtrip(body in r#"[\[{][ -~]{0,30}"#) {
+            let mut w = FramesWriter::new(Vec::new(), &header()).unwrap();
+            w.write_frame(crate::frames::Frame { kind: FrameKind::Text, recv_ts: 1, aux: 1, payload: body.as_bytes() }).unwrap();
+            let bin = w.into_inner();
+            let mut text = Vec::new();
+            dump(&bin[..], &mut text).unwrap();
+            let mut again = Vec::new();
+            pack(&text[..], &mut again).unwrap();
+            prop_assert_eq!(again, bin);
         }
 
         #[test]

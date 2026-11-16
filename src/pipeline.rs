@@ -57,6 +57,73 @@ pub enum QualityEvent {
     },
 }
 
+impl QualityEvent {
+    /// Short stable name, the vocabulary of the quality journal.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            QualityEvent::Connected { .. } => "connected",
+            QualityEvent::Disconnected { .. } => "disconnected",
+            QualityEvent::Sync(Quality::Gap { .. }) => "gap",
+            QualityEvent::Sync(Quality::SnapshotTooOld { .. }) => "snapshot_too_old",
+            QualityEvent::Sync(Quality::Invalid(_)) => "invalid_book",
+            QualityEvent::Sync(Quality::BufferOverflow { .. }) => "buffer_overflow",
+            QualityEvent::Sync(Quality::Reconnect) => "reconnect",
+            QualityEvent::Synced { first: true, .. } => "synced",
+            QualityEvent::Synced { first: false, .. } => "resync",
+            QualityEvent::BboMismatch { .. } => "bbo_mismatch",
+            QualityEvent::Undecodable { .. } => "undecodable",
+            QualityEvent::SnapshotFailed { .. } => "snapshot_failed",
+            QualityEvent::ServerShutdown { .. } => "server_shutdown",
+        }
+    }
+}
+
+impl std::fmt::Display for QualityEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let lv = |l: &Option<Level>| l.map_or("-".to_owned(), |l| format!("{}x{}", l.price, l.qty));
+        write!(f, "{}", self.kind())?;
+        match self {
+            QualityEvent::Connected { conn } => write!(f, " conn={conn}"),
+            QualityEvent::Disconnected { conn, reason } => {
+                write!(f, " conn={conn} reason={reason:?}")
+            }
+            QualityEvent::Sync(Quality::Gap { expected, got }) => {
+                write!(f, " expected={expected} got={got}")
+            }
+            QualityEvent::Sync(Quality::SnapshotTooOld {
+                snapshot,
+                first_buffered,
+            }) => {
+                write!(f, " snapshot={snapshot} first_buffered={first_buffered}")
+            }
+            QualityEvent::Sync(Quality::Invalid(e)) => write!(f, " {e}"),
+            QualityEvent::Sync(Quality::BufferOverflow { len }) => write!(f, " len={len}"),
+            QualityEvent::Sync(Quality::Reconnect) => Ok(()),
+            QualityEvent::Synced { update_id, .. } => write!(f, " update_id={update_id}"),
+            QualityEvent::BboMismatch {
+                update_id,
+                book_bid,
+                book_ask,
+                ticker,
+            } => write!(
+                f,
+                " update_id={update_id} book={}/{} ticker={}x{}/{}x{} (steps)",
+                lv(book_bid),
+                lv(book_ask),
+                ticker.bid_px,
+                ticker.bid_qty,
+                ticker.ask_px,
+                ticker.ask_qty
+            ),
+            QualityEvent::Undecodable { kind, reason } => {
+                write!(f, " kind={} reason={reason:?}", kind.name())
+            }
+            QualityEvent::SnapshotFailed { id, reason } => write!(f, " id={id} reason={reason:?}"),
+            QualityEvent::ServerShutdown { shutdown_ts } => write!(f, " shutdown_ts={shutdown_ts}"),
+        }
+    }
+}
+
 /// Receives the pipeline's output. Every method has an empty default.
 pub trait Sink {
     /// The book needs a REST snapshot; answer with a `Snapshot` frame whose `aux` is `id`.
@@ -706,6 +773,23 @@ mod tests {
         let (b, log_b) = run(&frames);
         assert_eq!(log_a.0, log_b.0);
         assert_eq!(a.stats(), b.stats());
+    }
+
+    #[test]
+    fn events_print_with_their_journal_name() {
+        let gap = QualityEvent::Sync(Quality::Gap {
+            expected: 106,
+            got: 107,
+        });
+        assert_eq!(gap.to_string(), "gap expected=106 got=107");
+        assert_eq!(
+            QualityEvent::Synced {
+                update_id: 7,
+                first: false
+            }
+            .to_string(),
+            "resync update_id=7"
+        );
     }
 
     #[test]
