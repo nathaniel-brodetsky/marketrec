@@ -281,3 +281,31 @@ fn damaged_recording_stops_at_the_damage() {
         "every frame but the damaged last one"
     );
 }
+
+#[test]
+fn after_a_stop_the_summary_shows_the_last_valid_book() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stopped.jsonl");
+    let mut text = fs::read_to_string(fixture("normal_start")).unwrap();
+    text.push_str(&format!(
+        "{{\"kind\":\"disconnected\",\"recv_ts\":{},\"aux\":1,\"payload\":\"stopped\"}}\n",
+        at(400)
+    ));
+    fs::write(&path, text).unwrap();
+    let r = replay_file(&path).unwrap();
+    assert_eq!(
+        r.state,
+        State::Resyncing,
+        "the book is not maintained after a stop"
+    );
+    let v = r.last_valid.unwrap();
+    assert_eq!(
+        (v.update_id, v.best_bid, v.best_ask),
+        (1007, lv(9712346, 1000), lv(9712347, 90000))
+    );
+    let summary = r.to_string();
+    assert!(
+        summary.contains("final book    recording stopped; last valid at update 1007: bid 97123.46000000 x 0.01000000, ask 97123.47000000 x 0.90000000"),
+        "{summary}"
+    );
+}

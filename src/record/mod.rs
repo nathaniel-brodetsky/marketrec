@@ -274,7 +274,7 @@ pub fn record(
                     if last.elapsed() >= Duration::from_millis(500) {
                         last = Instant::now();
                         let mut s = shared.lock().expect("lock");
-                        s.stats = pipeline.stats().clone();
+                        s.stats = pipeline.stats_so_far();
                         s.writer_dropped = wr_tx.total_dropped();
                     }
                 }
@@ -590,9 +590,13 @@ mod tests {
         let ws_base = ws_url.trim_end_matches("/stream").to_owned();
 
         let mut statuses = 0;
+        let mut status_valid_ns = 0;
         let mut events = Vec::new();
         let summary = record(config(dir.path(), rest, ws_base), |p| match p {
-            Progress::Status(_) => statuses += 1,
+            Progress::Status(st) => {
+                statuses += 1;
+                status_valid_ns = st.stats.synced_ns;
+            }
             Progress::Quality(_, e) => events.push(e.kind()),
             Progress::Fatal(m) => panic!("{m}"),
         })
@@ -609,6 +613,10 @@ mod tests {
         assert_eq!((summary.network_dropped, summary.writer_dropped), (0, 0));
         assert_eq!(events, ["connected", "synced", "disconnected"]);
         assert!(statuses >= 3, "a status every 200 ms: {statuses}");
+        assert!(
+            status_valid_ns > 0,
+            "status lines count the valid time while it lasts"
+        );
         assert_eq!(summary.files.len(), 1);
         let path = &summary.files[0];
         assert!(path.starts_with(dir.path().join("binance/BTCUSDT")));

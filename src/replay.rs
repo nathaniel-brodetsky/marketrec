@@ -80,6 +80,8 @@ pub struct Report {
     pub requests: Vec<u64>,
     /// Quality events with their receive times.
     pub events: Vec<(i64, QualityEvent)>,
+    /// The book the last time it was valid, also when it is not valid at the end.
+    pub last_valid: Option<ValidBook>,
     pub ending: Ending,
 }
 
@@ -93,9 +95,30 @@ impl Report {
 struct Collect {
     requests: Vec<u64>,
     events: Vec<(i64, QualityEvent)>,
+    last_valid: Option<ValidBook>,
+}
+
+/// The book at the last frame after which it was valid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValidBook {
+    pub recv_ts: i64,
+    pub update_id: u64,
+    pub best_bid: Option<Level>,
+    pub best_ask: Option<Level>,
 }
 
 impl Sink for Collect {
+    fn after_frame(&mut self, recv_ts: i64, _connected: bool, book: Option<&dyn OrderBook>) {
+        if let Some(b) = book {
+            self.last_valid = Some(ValidBook {
+                recv_ts,
+                update_id: b.update_id(),
+                best_bid: b.best(Side::Bid),
+                best_ask: b.best(Side::Ask),
+            });
+        }
+    }
+
     fn request_snapshot(&mut self, id: u64) {
         self.requests.push(id);
     }
@@ -235,6 +258,7 @@ impl Run {
             best_ask: if synced { book.best(Side::Ask) } else { None },
             requests: self.sink.requests,
             events: self.sink.events,
+            last_valid: self.sink.last_valid,
             ending,
         }
     }
@@ -301,7 +325,27 @@ impl fmt::Display for Report {
                 level(self.best_bid, price, qty),
                 level(self.best_ask, price, qty)
             )?,
-            _ => writeln!(f, "final book    not synchronized ({:?})", self.state)?,
+            Ok((price, qty)) => {
+                let stopped = self.events.last().is_some_and(|(_, e)| {
+                    matches!(e, QualityEvent::Disconnected { reason, .. } if reason == crate::net::ws::STOPPED)
+                });
+                let why = if stopped {
+                    "recording stopped".to_owned()
+                } else {
+                    format!("not synchronized ({:?})", self.state)
+                };
+                match self.last_valid {
+                    Some(v) => writeln!(
+                        f,
+                        "final book    {why}; last valid at update {}: bid {}, ask {}",
+                        v.update_id,
+                        level(v.best_bid, price, qty),
+                        level(v.best_ask, price, qty)
+                    )?,
+                    None => writeln!(f, "final book    {why}; never valid")?,
+                }
+            }
+            Err(_) => writeln!(f, "final book    not synchronized ({:?})", self.state)?,
         }
         match &self.ending {
             Ending::Clean => write!(f, "end           clean"),

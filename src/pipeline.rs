@@ -264,6 +264,16 @@ impl<B: OrderBook> Pipeline<B> {
         &self.stats
     }
 
+    /// The counters as of the last frame, with a valid interval still running counted up
+    /// to that frame. `stats` counts an interval only once it has ended.
+    pub fn stats_so_far(&self) -> Stats {
+        let mut s = self.stats.clone();
+        if let (Some(since), Some(last)) = (self.synced_since, s.last_ts) {
+            s.synced_ns += elapsed(since, last);
+        }
+        s
+    }
+
     pub fn on_frame(&mut self, frame: Frame<'_>, sink: &mut impl Sink) {
         let ts = frame.recv_ts;
         self.stats.frames += 1;
@@ -774,6 +784,21 @@ mod tests {
             0,
             "the replay saw no connection end"
         );
+    }
+
+    #[test]
+    fn stats_so_far_count_the_valid_time_still_running() {
+        let mut p = Pipeline::new(&header(), RefBook::new(), SyncConfig::default()).unwrap();
+        for f in normal_start() {
+            p.on_frame(f.as_frame(), &mut Log::default());
+        }
+        assert_eq!(p.stats().synced_ns, 0, "the interval has not ended");
+        assert_eq!(
+            p.stats_so_far().synced_ns,
+            70,
+            "from the snapshot at 30 to 100"
+        );
+        assert_eq!(p.finish().synced_ns, 70);
     }
 
     #[test]
