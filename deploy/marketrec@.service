@@ -1,0 +1,41 @@
+# One recorder per symbol, as the system user `marketrec`:
+#   systemctl enable --now marketrec@BTCUSDT
+# Logs: journalctl -u marketrec@BTCUSDT
+[Unit]
+Description=marketrec: record %i from Binance Spot
+Documentation=https://github.com/nathaniel-brodetsky/marketrec
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target
+
+[Service]
+Type=exec
+User=marketrec
+Group=marketrec
+WorkingDirectory=/var/lib/marketrec
+ExecStart=/usr/local/bin/marketrec record --symbol %i --out /var/lib/marketrec/data --status-every 60
+
+# SIGTERM is a clean stop: the open files are finished and the last one compressed
+KillSignal=SIGTERM
+TimeoutStopSec=120
+
+# restart after a crash or a lost network; a new run adds to the day it starts in
+Restart=always
+RestartSec=10
+# exit code 3: not enough free disk space; restarting would not help
+RestartPreventExitStatus=3
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/marketrec
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

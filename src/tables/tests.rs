@@ -562,3 +562,208 @@ fn a_diff_without_levels_is_one_row_with_side_zero() {
     );
     assert_eq!(side.iter().filter(|s| *s == Some(0)).count(), 1);
 }
+
+#[test]
+fn a_stall_is_a_late_interval_in_quality_and_manifest() {
+    let mut s = Session::new(12);
+    let t0 = DAY0 + 15 * NS_PER_HOUR;
+    s.connect(t0);
+    s.run(t0 + MS, t0 + 5 * SEC, 100 * MS);
+    s.lag = 3 * SEC; // the stream stalls: everything arrives 3 s late
+    s.run(t0 + 5 * SEC, t0 + 10 * SEC, 100 * MS);
+    s.lag = 0;
+    s.run(t0 + 10 * SEC, t0 + 15 * SEC, 100 * MS);
+    s.disconnect(t0 + 15 * SEC, STOPPED);
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("binance/BTCUSDT");
+    let stats = derive(&s.frames, &root);
+    let day = root.join("2026-11-21");
+
+    let q = quality(&day);
+    let late: Vec<&(i64, String)> = q
+        .iter()
+        .filter(|(_, k)| k == "late" || k == "on_time")
+        .collect();
+    assert_eq!(
+        late,
+        [
+            &(t0 + 5 * SEC, "late".to_owned()),
+            &(t0 + 10 * SEC, "on_time".to_owned())
+        ]
+    );
+    let m = read_manifest(&day).unwrap();
+    assert_eq!(m.late_ns, 5 * SEC);
+    assert_eq!(stats.late_ns, 5 * SEC);
+    assert_eq!(m.lag, stats.lag, "the day holds every update of the run");
+    assert_eq!(m.lag.count() as usize, s.depth.len());
+    assert_eq!((m.lag_p50_ms, m.lag_p99_ms), (Some(0), Some(3000)));
+    assert_eq!(m.synced_ns, stats.synced_ns, "late is not invalid");
+
+    let r = crate::verify::verify_day(
+        &day,
+        &crate::verify::VerifyOptions {
+            quick: true,
+            scratch: None,
+        },
+    );
+    let f = r.check("freshness").unwrap();
+    assert_eq!(f.outcome, crate::verify::Outcome::Warn, "{r}");
+    assert!(
+        f.detail
+            .contains("more than 1 s behind the exchange 1 time for 5.0 s"),
+        "{}",
+        f.detail
+    );
+}
+
+#[test]
+fn late_time_is_split_at_midnight() {
+    let mut s = Session::new(13);
+    let midnight = DAY0 + 24 * NS_PER_HOUR;
+    s.connect(midnight - 10 * SEC);
+    s.run(midnight - 10 * SEC + MS, midnight - 2 * SEC, 100 * MS);
+    s.lag = 2 * SEC;
+    s.run(midnight - 2 * SEC, midnight + 3 * SEC, 100 * MS);
+    s.lag = 0;
+    s.run(midnight + 3 * SEC, midnight + 5 * SEC, 100 * MS);
+    let dir = tempfile::tempdir().unwrap();
+    let stats = derive(&s.frames, dir.path());
+    let m1 = read_manifest(&dir.path().join("2026-11-21")).unwrap();
+    let m2 = read_manifest(&dir.path().join("2026-11-22")).unwrap();
+    assert_eq!((m1.late_ns, m2.late_ns), (2 * SEC, 3 * SEC));
+    assert_eq!(m1.late_ns + m2.late_ns, stats.late_ns);
+    let mut both = m1.lag.clone();
+    both.merge(&m2.lag);
+    assert_eq!(both, stats.lag);
+}
+
+/// A stall with the given round trip during it: what verify concludes.
+fn stall_diagnosis(rtt_during: i64) -> String {
+    let mut s = Session::new(14);
+    let t0 = DAY0 + 16 * NS_PER_HOUR;
+    s.connect(t0);
+    s.run(t0 + MS, t0 + 10 * SEC, 100 * MS);
+    for k in 1..10 {
+        s.probe(t0 + k * SEC + 50 * MS, 140 * MS);
+    }
+    s.lag = 4 * SEC;
+    s.run(t0 + 10 * SEC, t0 + 20 * SEC, 100 * MS);
+    for k in 10..20 {
+        s.probe(t0 + k * SEC + 50 * MS, rtt_during);
+    }
+    s.lag = 0;
+    s.run(t0 + 20 * SEC, t0 + 25 * SEC, 100 * MS);
+    s.frames.sort_by_key(|f| f.recv_ts); // probes were pushed after the messages
+    s.disconnect(t0 + 25 * SEC, STOPPED);
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("binance/BTCUSDT");
+    let stats = derive(&s.frames, &root);
+    let day = root.join("2026-11-21");
+    let m = read_manifest(&day).unwrap();
+    assert_eq!(m.rtt, stats.rtt);
+    assert_eq!(m.rtt.count(), 19);
+    let t = read_table(&day, Table::LinkRtt).unwrap();
+    assert_eq!(t.num_rows(), 19);
+    assert!(i64s(&t, "conn").iter().all(|&c| c == 1));
+    let r = crate::verify::verify_day(
+        &day,
+        &crate::verify::VerifyOptions {
+            quick: true,
+            scratch: None,
+        },
+    );
+    r.check("freshness").unwrap().detail.clone()
+}
+
+#[test]
+fn round_trips_tell_a_slow_link_from_a_late_exchange() {
+    let normal = stall_diagnosis(150 * MS);
+    assert!(
+        normal.contains("round trip of the link p50 150 ms"),
+        "{normal}"
+    );
+    assert!(
+        normal.contains("round trip inside them p50 150 ms (10 probes), elsewhere p50 140 ms: the link answered as usual"),
+        "{normal}"
+    );
+    let slow = stall_diagnosis(3 * SEC);
+    assert!(
+        slow.contains("round trip inside them p50 3000 ms (10 probes), elsewhere p50 140 ms: the connection itself was slow"),
+        "{slow}"
+    );
+}
+
+#[test]
+fn a_takeover_by_a_second_connection_adds_no_rows() {
+    use crate::frames::FrameKind;
+    let mut s = Session::new(15);
+    let t0 = DAY0 + 18 * NS_PER_HOUR;
+    s.connect(t0);
+    s.run(t0 + MS, t0 + 10 * SEC, 50 * MS);
+    let single = s.frames.clone();
+    // connection 2 opens at 4 s and delivers every message 7 ms after connection 1, which
+    // closes at 8 s
+    let (open2, close1) = (t0 + 4 * SEC, t0 + 8 * SEC);
+    let mut two = Vec::new();
+    let mut copies = 0;
+    for f in &single {
+        let text = f.kind == FrameKind::Text;
+        if !text || f.recv_ts < close1 {
+            two.push(f.clone());
+        }
+        if text && f.recv_ts >= open2 {
+            let mut c = f.clone();
+            c.aux = 2;
+            c.recv_ts += 7 * MS;
+            copies += u64::from(f.recv_ts < close1);
+            two.push(c);
+        }
+    }
+    let link = |kind, ts, conn, payload: &str| crate::frames::OwnedFrame {
+        kind,
+        recv_ts: ts,
+        aux: conn,
+        payload: payload.as_bytes().to_vec(),
+    };
+    two.push(link(
+        FrameKind::Connected,
+        open2 - MS,
+        2,
+        "wss://test/stream",
+    ));
+    two.push(link(FrameKind::Disconnected, close1, 1, "handover"));
+    two.sort_by_key(|f| f.recv_ts);
+
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+    derive(&single, &a);
+    let stats = derive(&two, &b);
+    let (a, b) = (a.join("2026-11-21"), b.join("2026-11-21"));
+    let content = |day: &Path, table: Table, skip: usize| -> RecordBatch {
+        let t = read_table(day, table).unwrap();
+        t.project(&(skip..t.num_columns()).collect::<Vec<_>>())
+            .unwrap()
+    };
+    // the same messages, once each, whichever connection brought them
+    assert_eq!(
+        content(&a, Table::DepthDiff, 1),
+        content(&b, Table::DepthDiff, 1)
+    );
+    assert_eq!(content(&a, Table::Trades, 1), content(&b, Table::Trades, 1));
+    assert_eq!(
+        content(&a, Table::BookTicker, 1),
+        content(&b, Table::BookTicker, 1)
+    );
+    let m = read_manifest(&b).unwrap();
+    assert_eq!(m.duplicates, copies);
+    assert_eq!(stats.duplicates, copies);
+    assert!(copies > 100);
+    let kinds: Vec<String> = quality(&b).into_iter().map(|(_, k)| k).collect();
+    assert_eq!(kinds, ["connected", "synced", "connected", "disconnected"]);
+    assert_eq!(m.synced_ns, stats.synced_ns);
+    assert_eq!(
+        read_manifest(&a).unwrap().covered_ns,
+        m.covered_ns - 7 * MS,
+        "connected the same time, plus the 7 ms connection 2 delivered the last message later"
+    );
+}

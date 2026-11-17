@@ -17,12 +17,13 @@
 //! Stopping (Ctrl+C, SIGTERM or the configured duration) flows downstream: the session
 //! closes and reports `disconnected`, the queues drain, the last file is synced and renamed.
 
+pub mod disk;
 pub mod fetch;
 pub mod queue;
 pub mod writer;
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::thread;
@@ -30,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, watch};
 
-use crate::book::RefBook;
+use crate::book::{LadderBook, RefBook};
 use crate::frames::{FrameKind, Header, OwnedFrame};
 use crate::json::TimeUnit;
 use crate::net::rest::{Rest, RestError};
@@ -55,10 +56,22 @@ pub struct RecordConfig {
     /// Capacity of each of the two queues, in frames.
     pub queue_capacity: usize,
     pub stale_after: Duration,
+    /// Pause between round-trip pings.
+    pub probe_every: Duration,
+    /// Age at which a connection is replaced make-before-break, and how long the two
+    /// deliver together.
+    pub rotate_after: Duration,
+    pub overlap: Duration,
     pub backoff: BackoffConfig,
     pub status_every: Duration,
     /// Stop on Ctrl+C and SIGTERM. Off in tests.
     pub handle_signals: bool,
+    /// zstd level for finished hourly frames files; `None` keeps them uncompressed.
+    pub compress_level: Option<i32>,
+    /// Refuse to start, and stop cleanly, below this much free space on the data disk.
+    pub min_free_bytes: u64,
+    /// How free space is measured; a test can put its own here.
+    pub disk_free: fn(&Path) -> Option<u64>,
 }
 
 impl RecordConfig {
@@ -72,9 +85,15 @@ impl RecordConfig {
             fetch: FetchConfig::default(),
             queue_capacity: 1 << 16,
             stale_after: Duration::from_secs(15),
+            probe_every: ws::PROBE_EVERY,
+            rotate_after: ws::ROTATE_AFTER,
+            overlap: ws::OVERLAP,
             backoff: BackoffConfig::default(),
             status_every: Duration::from_secs(10),
             handle_signals: true,
+            compress_level: Some(crate::frames::zst::LEVEL),
+            min_free_bytes: disk::MIN_FREE,
+            disk_free: disk::free_bytes,
         }
     }
 }
@@ -82,10 +101,12 @@ impl RecordConfig {
 /// Progress, delivered on the calling thread.
 #[derive(Debug, Clone)]
 pub enum Progress {
-    Status(Status),
+    Status(Box<Status>),
     Quality(i64, QualityEvent),
     /// Something that ends the recording early, for example a disk error.
     Fatal(String),
+    /// The recording stops on purpose before its end, for example because the disk fills.
+    Stopping(String),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -97,6 +118,8 @@ pub struct Status {
     pub network_queue_max: usize,
     pub writer_queue_max: usize,
     pub writer_dropped: u64,
+    /// Free space on the data disk, if it can be told.
+    pub disk_free: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -108,11 +131,17 @@ pub struct RecordSummary {
     pub files: Vec<PathBuf>,
     /// Parquet parts and manifests.
     pub tables: Vec<PathBuf>,
+    /// Bytes of frames before and after compression, for the files that were compressed.
+    pub compressed: (u64, u64),
+    /// Files left uncompressed because compressing them failed, with the reason.
+    pub not_compressed: Vec<(PathBuf, String)>,
     pub bytes_written: u64,
     pub network_dropped: u64,
     pub writer_dropped: u64,
     pub network_queue_max: usize,
     pub writer_queue_max: usize,
+    /// Why the recording stopped early on purpose: the disk filled up.
+    pub low_disk: Option<String>,
 }
 
 #[derive(Debug)]
@@ -122,6 +151,11 @@ pub enum RecordError {
     Io(std::io::Error),
     /// A worker thread failed.
     Thread(String),
+    /// Less free space on the data disk than the configured minimum.
+    LowDisk {
+        free: u64,
+        min: u64,
+    },
 }
 
 impl fmt::Display for RecordError {
@@ -131,6 +165,12 @@ impl fmt::Display for RecordError {
             RecordError::BadRules(e) => write!(f, "symbol rules: {e}"),
             RecordError::Io(e) => write!(f, "{e}"),
             RecordError::Thread(e) => write!(f, "{e}"),
+            RecordError::LowDisk { free, min } => write!(
+                f,
+                "only {} free on the data disk, below the minimum of {}",
+                disk::gb(*free),
+                disk::gb(*min)
+            ),
         }
     }
 }
@@ -182,6 +222,14 @@ pub fn record(
     cfg: RecordConfig,
     mut progress: impl FnMut(Progress),
 ) -> Result<RecordSummary, RecordError> {
+    if let Some(free) = (cfg.disk_free)(&cfg.out)
+        && free < cfg.min_free_bytes
+    {
+        return Err(RecordError::LowDisk {
+            free,
+            min: cfg.min_free_bytes,
+        });
+    }
     let rest = Rest::new(&cfg.rest_base, Duration::from_secs(10)).map_err(RecordError::Rest)?;
     let info = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -198,7 +246,9 @@ pub fn record(
     header
         .grids()
         .map_err(|e| RecordError::BadRules(e.to_string()))?;
-    let pipeline = Pipeline::new(&header, RefBook::new(), SyncConfig::default())
+    // the hot path uses the fast book; the writer derives the tables with the reference
+    // book, so every live run also checks one against the other (see the tests)
+    let pipeline = Pipeline::new(&header, LadderBook::new(), SyncConfig::default())
         .map_err(|e| RecordError::BadRules(e.to_string()))?;
 
     let started = Instant::now();
@@ -212,11 +262,13 @@ pub fn record(
 
     let writer = {
         let (shared, progress_tx, header) = (shared.clone(), progress_tx.clone(), header.clone());
+        let level = cfg.compress_level;
         thread::Builder::new()
             .name("marketrec-writer".into())
             .spawn(
-                move || -> Result<(Vec<PathBuf>, Vec<PathBuf>, u64), String> {
+                move || -> Result<(Vec<PathBuf>, Vec<PathBuf>, u64, Compression), String> {
                     let mut rot = Rotator::new(&root, header.clone());
+                    let compressor = Compressor::start(level)?;
                     // the tables are derived from the frames by a pipeline of their own, exactly
                     // as `marketrec convert` derives them offline
                     let mut tables = Tables::new(&root, header.clone(), &recorder_id());
@@ -228,8 +280,10 @@ pub fn record(
                         Err(msg)
                     };
                     while let Some(frame) = wr_rx.recv() {
-                        if let Err(e) = rot.write(&frame) {
-                            return fail(format!("writing frames failed: {e}"));
+                        match rot.write(&frame) {
+                            Ok(Some(closed)) => compressor.add(closed),
+                            Ok(None) => {}
+                            Err(e) => return fail(format!("writing frames failed: {e}")),
                         }
                         derive.on_frame(frame.as_frame(), &mut tables);
                         if let Some(e) = tables.error() {
@@ -246,10 +300,15 @@ pub fn record(
                     let frames = rot
                         .finish()
                         .map_err(|e| format!("finishing frames file failed: {e}"))?;
+                    if let Some(last) = frames.last() {
+                        compressor.add(last.clone());
+                    }
                     let tables = tables
                         .finish()
                         .map_err(|e| format!("finishing tables failed: {e}"))?;
-                    Ok((frames, tables, bytes))
+                    let compression = compressor.finish();
+                    let frames = frames.iter().map(|p| compression.final_path(p)).collect();
+                    Ok((frames, tables, bytes, compression))
                 },
             )?
     };
@@ -287,6 +346,9 @@ pub fn record(
         let ws_cfg = WsConfig {
             url: ws::stream_url(&cfg.ws_base, &header.symbol, TimeUnit::Micro),
             stale_after: cfg.stale_after,
+            probe_every: cfg.probe_every,
+            rotate_after: cfg.rotate_after,
+            overlap: cfg.overlap,
             connect_timeout: Duration::from_secs(10),
             backoff: cfg.backoff,
             seed: now_ns() as u64,
@@ -333,6 +395,7 @@ pub fn record(
     // the calling thread reports progress until the network thread is done
     let mut next_status = Instant::now() + cfg.status_every;
     let mut fatal = None;
+    let mut low_disk = None;
     while !network.is_finished() {
         let wait = next_status
             .saturating_duration_since(Instant::now())
@@ -348,8 +411,21 @@ pub fn record(
         }
         if Instant::now() >= next_status {
             next_status += cfg.status_every;
+            let disk_free = (cfg.disk_free)(&cfg.out);
+            if let Some(free) = disk_free.filter(|&f| f < cfg.min_free_bytes)
+                && low_disk.is_none()
+            {
+                let msg = format!(
+                    "only {} free on the data disk, below the minimum of {}: stopping",
+                    disk::gb(free),
+                    disk::gb(cfg.min_free_bytes)
+                );
+                stop_flag.store(true, Ordering::Relaxed);
+                progress(Progress::Stopping(msg.clone()));
+                low_disk = Some(msg);
+            }
             let s = shared.lock().expect("lock");
-            progress(Progress::Status(Status {
+            progress(Progress::Status(Box::new(Status {
                 elapsed: started.elapsed(),
                 stats: s.stats.clone(),
                 bytes_written: s.bytes_written,
@@ -357,7 +433,8 @@ pub fn record(
                 network_queue_max: net_hw.get(),
                 writer_queue_max: wr_hw.get(),
                 writer_dropped: s.writer_dropped,
-            }));
+                disk_free,
+            })));
         }
     }
     let network_dropped = network
@@ -374,7 +451,7 @@ pub fn record(
     for p in progress_rx.try_iter() {
         progress(p);
     }
-    let (files, tables, bytes_written) = written.map_err(RecordError::Thread)?;
+    let (files, tables, bytes_written, compression) = written.map_err(RecordError::Thread)?;
     if let Some(msg) = fatal {
         return Err(RecordError::Thread(msg));
     }
@@ -384,12 +461,87 @@ pub fn record(
         stats,
         files,
         tables,
+        compressed: (compression.raw_bytes, compression.compressed_bytes),
+        not_compressed: compression.failed,
         bytes_written,
         network_dropped,
         writer_dropped,
         network_queue_max: net_hw.get(),
         writer_queue_max: wr_hw.get(),
+        low_disk,
     })
+}
+
+/// Compresses finished hourly frames files on a thread of its own, so the writer never
+/// waits for it.
+struct Compressor {
+    tx: Option<std_mpsc::Sender<PathBuf>>,
+    thread: Option<thread::JoinHandle<Compression>>,
+}
+
+#[derive(Debug, Default)]
+struct Compression {
+    done: Vec<(PathBuf, PathBuf)>,
+    failed: Vec<(PathBuf, String)>,
+    raw_bytes: u64,
+    compressed_bytes: u64,
+}
+
+impl Compression {
+    fn final_path(&self, raw: &Path) -> PathBuf {
+        self.done
+            .iter()
+            .find(|(r, _)| r == raw)
+            .map_or_else(|| raw.to_owned(), |(_, z)| z.clone())
+    }
+}
+
+impl Compressor {
+    fn start(level: Option<i32>) -> Result<Self, String> {
+        let Some(level) = level else {
+            return Ok(Self {
+                tx: None,
+                thread: None,
+            });
+        };
+        let (tx, rx) = std_mpsc::channel::<PathBuf>();
+        let thread = thread::Builder::new()
+            .name("marketrec-compress".into())
+            .spawn(move || {
+                let mut c = Compression::default();
+                for raw in rx {
+                    match crate::frames::zst::compress_file(&raw, level) {
+                        Ok(z) => {
+                            c.raw_bytes += z.raw_bytes;
+                            c.compressed_bytes += z.compressed_bytes;
+                            c.done.push((raw, z.path));
+                        }
+                        Err(e) => c.failed.push((raw, e.to_string())),
+                    }
+                }
+                c
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(Self {
+            tx: Some(tx),
+            thread: Some(thread),
+        })
+    }
+
+    fn add(&self, path: PathBuf) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(path);
+        }
+    }
+
+    /// Wait for the files sent so far.
+    fn finish(mut self) -> Compression {
+        drop(self.tx.take());
+        self.thread
+            .take()
+            .and_then(|t| t.join().ok())
+            .unwrap_or_default()
+    }
 }
 
 /// Program, version and the commit it was built from.
@@ -452,9 +604,11 @@ impl fmt::Display for Status {
             .map_or("-".into(), |n| n.to_string_lossy().into_owned());
         write!(
             f,
-            "{:>7.0} s | valid book {:5.1}% | {:6.0} frames/s | depth {} ticker {} trades {} | gaps {} resyncs {} reconnects {} | queue max {}/{} | written {:.1} MB {file}",
+            "{:>7.0} s | valid book {:5.1}% | lag {:>7} | rtt {:>7} | {:6.0} frames/s | depth {} ticker {} trades {} | gaps {} resyncs {} reconnects {} late {} | queue max {}/{} | written {:.1} MB {file} | disk {}",
             secs,
             s.synced_share() * 100.0,
+            s.last_lag_ns.map_or("-".into(), crate::timing::duration_ms),
+            s.last_rtt_ns.map_or("-".into(), crate::timing::duration_ms),
             s.frames as f64 / secs,
             s.depth,
             s.book_tickers,
@@ -462,9 +616,12 @@ impl fmt::Display for Status {
             s.gaps,
             s.resyncs,
             s.reconnects,
+            s.late_intervals,
             self.network_queue_max,
             self.writer_queue_max,
             self.bytes_written as f64 / 1e6,
+            self.disk_free
+                .map_or("?".into(), |b| format!("{} free", disk::gb(b))),
         )
     }
 }
@@ -516,11 +673,40 @@ impl fmt::Display for RecordSummary {
         )?;
         writeln!(
             f,
+            "lag           {}",
+            crate::timing::report_line(&s.lag, s.late_intervals, s.late_ns)
+        )?;
+        if s.duplicates > 0 {
+            writeln!(
+                f,
+                "duplicates    {} messages delivered first by another connection, dropped",
+                s.duplicates
+            )?;
+        }
+        writeln!(f, "link          {}", crate::timing::rtt_line(&s.rtt))?;
+        writeln!(
+            f,
             "written       {:.1} MB of frames in {} file(s), {} table file(s)",
             self.bytes_written as f64 / 1e6,
             self.files.len(),
             self.tables.len()
         )?;
+        let (raw, zst) = self.compressed;
+        if zst > 0 {
+            writeln!(
+                f,
+                "compressed    {:.1} MB of frames to {:.1} MB ({:.1}x)",
+                raw as f64 / 1e6,
+                zst as f64 / 1e6,
+                raw as f64 / zst as f64
+            )?;
+        }
+        for (p, why) in &self.not_compressed {
+            writeln!(f, "not compressed {}: {why}", p.display())?;
+        }
+        if let Some(why) = &self.low_disk {
+            writeln!(f, "stopped       {why}")?;
+        }
         for p in &self.files {
             writeln!(f, "              {}", p.display())?;
         }
@@ -539,7 +725,7 @@ mod tests {
 
     fn depth(first: u64, last: u64, bid: &str) -> Message {
         Message::text(format!(
-            r#"{{"stream":"btcusdt@depth@100ms","data":{{"e":"depthUpdate","E":1795219200000000,"s":"BTCUSDT","U":{first},"u":{last},"b":[["97123.45000000","{bid}"]],"a":[]}}}}"#
+            r#"{{"stream":"btcusdt@depth@100ms","data":{{"e":"depthUpdate","E":NOW_US,"s":"BTCUSDT","U":{first},"u":{last},"b":[["97123.45000000","{bid}"]],"a":[]}}}}"#
         ))
     }
 
@@ -550,6 +736,7 @@ mod tests {
         cfg.duration = Some(Duration::from_millis(1500));
         cfg.handle_signals = false;
         cfg.status_every = Duration::from_millis(200);
+        cfg.min_free_bytes = 0; // the tests must not depend on this machine's disk
         cfg.backoff = BackoffConfig {
             initial: Duration::from_millis(10),
             max: Duration::from_millis(50),
@@ -598,7 +785,7 @@ mod tests {
                 status_valid_ns = st.stats.synced_ns;
             }
             Progress::Quality(_, e) => events.push(e.kind()),
-            Progress::Fatal(m) => panic!("{m}"),
+            Progress::Fatal(m) | Progress::Stopping(m) => panic!("{m}"),
         })
         .unwrap();
 
@@ -619,6 +806,18 @@ mod tests {
         );
         assert_eq!(summary.files.len(), 1);
         let path = &summary.files[0];
+        assert!(
+            path.to_string_lossy().ends_with(".frames.zst"),
+            "finished files are compressed: {}",
+            path.display()
+        );
+        assert!(summary.compressed.1 > 0 && summary.compressed.1 < summary.compressed.0);
+        assert!(summary.not_compressed.is_empty());
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1,
+            "the raw file is gone"
+        );
         assert!(path.starts_with(dir.path().join("binance/BTCUSDT")));
         assert!(path.to_string_lossy().contains("/frames/"));
 
@@ -663,6 +862,147 @@ mod tests {
 
         let report = crate::verify::verify_day(live_day, &Default::default());
         assert_eq!(report.outcome(), crate::verify::Outcome::Pass, "{report}");
+    }
+
+    /// The ТЗ's stage 5: a connection replaced during a recording costs no gap, no
+    /// snapshot and no rebuild.
+    #[test]
+    fn a_connection_replaced_mid_recording_costs_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let rest = mock_http_thread(vec![
+            ("/api/v3/exchangeInfo", "200 OK", "", EXCHANGE_INFO),
+            ("/api/v3/depth", "200 OK", "", SNAPSHOT),
+        ]);
+        // the same stream on both connections; the second sends faster to catch up
+        let stream: Vec<Message> = std::iter::once(depth(998, 1000, "0.25000000"))
+            .chain((0..80).map(|i| {
+                let first = 1001 + 2 * i;
+                depth(first, first + 1, &format!("0.{:02}000000", 10 + i))
+            }))
+            .collect();
+        // after 20 updates the exchange announces the end of connection 1
+        let mut first = stream.clone();
+        first.insert(
+            21,
+            Message::text(
+                r#"{"stream":"!serverShutdown","data":{"e":"serverShutdown","E":1,"T":2}}"#,
+            ),
+        );
+        let ws_url = server_thread(vec![
+            Script::SendSlowlyThenWait(first, Duration::from_millis(10)),
+            Script::SendSlowlyThenWait(stream, Duration::from_millis(3)),
+        ]);
+        let mut cfg = config(
+            dir.path(),
+            rest,
+            ws_url.trim_end_matches("/stream").to_owned(),
+        );
+        cfg.overlap = Duration::from_millis(100);
+        let mut events = Vec::new();
+        let summary = record(cfg, |p| {
+            if let Progress::Quality(_, e) = p {
+                events.push(e.to_string());
+            }
+        })
+        .unwrap();
+        let s = &summary.stats;
+        assert_eq!(
+            (s.gaps, s.resyncs, s.reconnects, s.snapshot_requests),
+            (0, 0, 0, 1),
+            "{events:?}"
+        );
+        assert_eq!(s.depth, 81, "every update once");
+        assert!(s.duplicates > 0);
+        let kinds: Vec<&str> = events
+            .iter()
+            .map(|e| e.split(' ').next().unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "connected",
+                "synced",
+                "server_shutdown",
+                "connected",
+                "disconnected",
+                "disconnected"
+            ],
+            "{events:?}"
+        );
+        assert!(
+            events[5].contains("conn=2 reason=\"stopped\""),
+            "{events:?}"
+        );
+        assert!(
+            events[4].contains("conn=1 reason=\"handover\""),
+            "{events:?}"
+        );
+        let day = summary.files[0].parent().unwrap().parent().unwrap();
+        let report = crate::verify::verify_day(day, &Default::default());
+        assert_eq!(report.outcome(), crate::verify::Outcome::Pass, "{report}");
+    }
+
+    #[test]
+    fn a_full_disk_refuses_the_start_and_a_filling_one_stops_the_recording_cleanly() {
+        use std::sync::atomic::AtomicU64;
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config(
+            dir.path(),
+            "http://127.0.0.1:9".into(),
+            "ws://127.0.0.1:9".into(),
+        );
+        cfg.min_free_bytes = u64::MAX;
+        let err = record(cfg, |_| {}).unwrap_err();
+        assert!(matches!(err, RecordError::LowDisk { .. }), "{err}");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+
+        // free space falls below the limit during a recording
+        static FREE: AtomicU64 = AtomicU64::new(u64::MAX);
+        fn fake(_: &Path) -> Option<u64> {
+            Some(FREE.load(Ordering::Relaxed))
+        }
+        let rest = mock_http_thread(vec![
+            ("/api/v3/exchangeInfo", "200 OK", "", EXCHANGE_INFO),
+            ("/api/v3/depth", "200 OK", "", SNAPSHOT),
+        ]);
+        let msgs: Vec<Message> = (0..300)
+            .map(|i| depth(1001 + i, 1001 + i, "0.10000000"))
+            .collect();
+        let ws_url = server_thread(vec![Script::SendSlowlyThenWait(
+            msgs,
+            Duration::from_millis(10),
+        )]);
+        let mut cfg = config(
+            dir.path(),
+            rest,
+            ws_url.trim_end_matches("/stream").to_owned(),
+        );
+        cfg.duration = Some(Duration::from_secs(20));
+        cfg.min_free_bytes = 1_000_000_000;
+        cfg.disk_free = fake;
+        let mut stopping = Vec::new();
+        let started = Instant::now();
+        let summary = record(cfg, |p| match p {
+            Progress::Status(s) => {
+                if s.disk_free == Some(u64::MAX) && s.stats.depth > 20 {
+                    FREE.store(500_000_000, Ordering::Relaxed);
+                }
+            }
+            Progress::Stopping(m) => stopping.push(m),
+            _ => {}
+        })
+        .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10), "stopped early");
+        assert_eq!(stopping.len(), 1, "{stopping:?}");
+        assert!(stopping[0].contains("only 0.5 GB free"), "{stopping:?}");
+        assert!(summary.low_disk.is_some());
+        let day = summary.files[0].parent().unwrap().parent().unwrap();
+        let report = crate::verify::verify_day(day, &Default::default());
+        assert_eq!(
+            report.outcome(),
+            crate::verify::Outcome::Pass,
+            "a clean stop: {report}"
+        );
     }
 
     #[test]

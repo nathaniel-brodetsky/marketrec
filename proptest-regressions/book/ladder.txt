@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 41e2fc7f288c7288897a07b05e11c89cc5db866759c10787a0b2559de71ae0b5 # shrinks to ops = [Set(Bid, 0, 0), Set(Bid, 0, 0), Diff(0, [], [Level { price: 1, qty: 1 }, Level { price: 2, qty: 1 }, Level { price: 30, qty: 1 }, Level { price: 30, qty: 0 }])]
+cc 1f95d63b52833c7dec43cef153431be231d8872e6f0739f78375538b915ef01f # shrinks to ops = [Snapshot(0, [], [Level { price: 1, qty: 0 }])]

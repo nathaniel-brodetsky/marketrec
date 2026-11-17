@@ -7,8 +7,7 @@
 //! corrupt.
 
 use std::fmt;
-use std::fs::File;
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead};
 use std::path::Path;
 
 use crate::book::{OrderBook, RefBook, Side};
@@ -108,7 +107,12 @@ pub struct ValidBook {
 }
 
 impl Sink for Collect {
-    fn after_frame(&mut self, recv_ts: i64, _connected: bool, book: Option<&dyn OrderBook>) {
+    fn after_frame(
+        &mut self,
+        recv_ts: i64,
+        _state: crate::pipeline::FrameState,
+        book: Option<&dyn OrderBook>,
+    ) {
         if let Some(b) = book {
             self.last_valid = Some(ValidBook {
                 recv_ts,
@@ -140,9 +144,10 @@ enum Reader<R: BufRead> {
     Text(TextReader<R>),
 }
 
-impl Input<BufReader<File>> {
+impl Input<Box<dyn BufRead + Send>> {
+    /// A frames file in any form: binary, compressed binary (`.frames.zst`) or text.
     pub fn open(path: &Path) -> Result<Self, ReplayError> {
-        Input::new(BufReader::with_capacity(1 << 20, File::open(path)?))
+        Input::new(crate::frames::zst::open(path)?)
     }
 }
 
@@ -317,6 +322,21 @@ impl fmt::Display for Report {
             "valid book    {:.1}% of the time",
             s.synced_share() * 100.0
         )?;
+        writeln!(
+            f,
+            "lag           {}",
+            crate::timing::report_line(&s.lag, s.late_intervals, s.late_ns)
+        )?;
+        if s.duplicates > 0 {
+            writeln!(
+                f,
+                "duplicates    {} messages delivered first by another connection, dropped",
+                s.duplicates
+            )?;
+        }
+        if s.rtt.count() > 0 {
+            writeln!(f, "link          {}", crate::timing::rtt_line(&s.rtt))?;
+        }
         match h.grids() {
             Ok((price, qty)) if self.state == State::Synced => writeln!(
                 f,

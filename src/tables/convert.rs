@@ -130,7 +130,8 @@ impl fmt::Display for ConvertSummary {
     }
 }
 
-/// A frames file, or every `*.frames` and `*.jsonl` file under a directory in path order,
+/// A frames file, or every `*.frames`, `*.frames.zst` and `*.jsonl` file under a directory in
+/// path order,
 /// which is time order for the recorder's `<date>/frames/<HH-MM-SS>.frames` layout. A
 /// `*.frames.tmp` file is the unfinished file of a recorder that crashed; it is included,
 /// since it is the only record of that hour and reads up to the crash.
@@ -149,6 +150,7 @@ pub fn input_files(input: &Path) -> io::Result<Vec<PathBuf>> {
                 .extension()
                 .is_some_and(|e| e == "frames" || e == "jsonl")
                 || path.to_string_lossy().ends_with(".frames.tmp")
+                || path.to_string_lossy().ends_with(".frames.zst")
             {
                 out.push(path);
             }

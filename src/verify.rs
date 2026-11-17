@@ -11,6 +11,8 @@
 //!   While the quality journal says the book is valid, every update must continue the
 //!   previous one, and every `book_l20` row must be well formed and carry the update ID the
 //!   stream has reached.
+//! - `freshness`: how late the depth updates arrived after their exchange time, and the
+//!   intervals in which the data was more than a second behind (a valid but stale book).
 //! - `rebuild`: the tables built again from the frames (this day's and the day before's)
 //!   equal the stored ones row for row.
 
@@ -29,6 +31,7 @@ use crate::tables::manifest::DayManifest;
 use crate::tables::read::{TableStream, first_difference, parts, read_manifest};
 use crate::tables::schema::{L20, SCHEMA_VERSION, Table};
 use crate::time::{NS_PER_DAY, Utc, day_start, hour_start};
+use crate::timing::{MsHistogram, duration_ms};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Outcome {
@@ -133,6 +136,7 @@ pub fn verify_day(day: &Path, opts: &VerifyOptions) -> VerifyReport {
     check_rows(&m, &found, &mut report);
     check_hours(day, &m, &mut report);
     check_continuity(day, &m, &mut report);
+    check_freshness(day, &m, &mut report);
     if !opts.quick {
         check_rebuild(day, &m, &found, opts, &mut report);
     }
@@ -621,6 +625,122 @@ fn continuity(day: &Path, m: &DayManifest) -> Result<(Outcome, String), String> 
     }
 }
 
+/// Late intervals from the quality journal: from `late` to the next `on_time`, or to the
+/// end of the connection, or to the end of the day's data.
+fn late_intervals(day: &Path, m: &DayManifest) -> Result<Vec<(i64, i64)>, String> {
+    let end_of_day = m
+        .runs
+        .iter()
+        .filter_map(|r| r.last_recv_ts)
+        .max()
+        .unwrap_or(i64::MAX);
+    let mut out = Vec::new();
+    let mut open: Option<i64> = None;
+    for batch in TableStream::new(Table::Quality, listed(day, m, Table::Quality), None) {
+        let batch = batch.map_err(|e| e.to_string())?;
+        let (kind, detail) = (
+            batch.column(1).as_string::<i32>(),
+            batch.column(2).as_string::<i32>(),
+        );
+        for (i, &ts) in i64_col(&batch, 0).iter().enumerate() {
+            match kind.value(i) {
+                "late" => {
+                    open.get_or_insert(ts);
+                }
+                "on_time" | "reconnect" => out.extend(open.take().map(|s| (s, ts))),
+                "disconnected" if detail.value(i).contains("reason=\"stopped\"") => {
+                    out.extend(open.take().map(|s| (s, ts)))
+                }
+                _ => {}
+            }
+        }
+    }
+    out.extend(open.map(|s| (s, end_of_day)));
+    Ok(out)
+}
+
+/// Round trips inside and outside the late intervals.
+fn rtt_split(
+    day: &Path,
+    m: &DayManifest,
+    late: &[(i64, i64)],
+) -> Result<(MsHistogram, MsHistogram), String> {
+    let (mut inside, mut outside) = (MsHistogram::default(), MsHistogram::default());
+    for batch in TableStream::new(Table::LinkRtt, listed(day, m, Table::LinkRtt), None) {
+        let batch = batch.map_err(|e| e.to_string())?;
+        for (&ts, &rtt) in i64_col(&batch, 0).iter().zip(i64_col(&batch, 2)) {
+            if late.iter().any(|&(a, b)| (a..=b).contains(&ts)) {
+                inside.record(rtt);
+            } else {
+                outside.record(rtt);
+            }
+        }
+    }
+    Ok((inside, outside))
+}
+
+/// Why the data was late, from the round trips: a slow link, or delay before it.
+fn diagnose(inside: &MsHistogram, outside: &MsHistogram) -> String {
+    let Some(in50) = inside.quantile_ms(0.5) else {
+        return "no round-trip probe fell inside the late intervals".into();
+    };
+    let mut line = format!(
+        "round trip inside them p50 {} ({} probes)",
+        duration_ms(in50 as i64 * 1_000_000),
+        inside.count()
+    );
+    match outside.quantile_ms(0.5) {
+        Some(out50) => {
+            line += &format!(", elsewhere p50 {}", duration_ms(out50 as i64 * 1_000_000));
+            if in50 >= 3 * out50 && in50 >= out50 + 200 {
+                line +=
+                    ": the connection itself was slow (the network, or the exchange's send buffer)";
+            } else {
+                line += ": the link answered as usual, so the data was late before it entered the connection, at the exchange";
+            }
+        }
+        None => line += "; no probe outside them to compare with",
+    }
+    line
+}
+
+fn check_freshness(day: &Path, m: &DayManifest, report: &mut VerifyReport) {
+    let lag = &m.lag;
+    if lag.count() == 0 && lag.below_zero == 0 {
+        report.push("freshness", Outcome::Pass, "no depth updates");
+        return;
+    }
+    let mut detail = format!(
+        "depth updates arrived {} after their exchange time",
+        lag.summary()
+    );
+    if m.rtt.count() > 0 {
+        detail += &format!("; round trip of the link {}", m.rtt.summary());
+    }
+    let mut outcome = Outcome::Pass;
+    let late = m.quality.get("late").copied().unwrap_or(0);
+    if late > 0 || m.late_ns > 0 {
+        outcome = Outcome::Warn;
+        detail += &format!(
+            "\nmore than 1 s behind the exchange {late} time{} for {:.1} s in all: the book was correct there but stale; `late` and `on_time` in quality mark the intervals",
+            if late == 1 { "" } else { "s" },
+            m.late_ns as f64 / 1e9
+        );
+        match late_intervals(day, m).and_then(|late| rtt_split(day, m, &late)) {
+            Ok((inside, outside)) => detail += &format!("\n{}", diagnose(&inside, &outside)),
+            Err(e) => detail += &format!("\nround trips not read: {e}"),
+        }
+    }
+    if lag.below_zero > 0 {
+        outcome = Outcome::Warn;
+        detail += &format!(
+            "\n{} updates arrived before their exchange time: this machine's clock is behind, so lags are understated",
+            lag.below_zero
+        );
+    }
+    report.push("freshness", outcome, detail);
+}
+
 /// A directory removed when dropped.
 struct Scratch(PathBuf);
 
@@ -737,11 +857,18 @@ fn check_rebuild(
     if !state_unknown && differ.is_empty() {
         match read_manifest(&rebuilt) {
             Ok(r) => {
-                if (r.covered_ns, r.synced_ns) != (m.covered_ns, m.synced_ns) {
+                if (r.covered_ns, r.synced_ns, r.late_ns) != (m.covered_ns, m.synced_ns, m.late_ns)
+                {
                     differ.push(format!(
-                        "manifest: connected {} ns and valid {} ns, rebuilt {} and {}",
-                        m.covered_ns, m.synced_ns, r.covered_ns, r.synced_ns
+                        "manifest: connected {} ns, valid {} ns, late {} ns; rebuilt {}, {}, {}",
+                        m.covered_ns, m.synced_ns, m.late_ns, r.covered_ns, r.synced_ns, r.late_ns
                     ));
+                }
+                if r.lag != m.lag {
+                    differ.push("manifest: the lag histogram differs".into());
+                }
+                if r.rtt != m.rtt {
+                    differ.push("manifest: the round-trip histogram differs".into());
                 }
             }
             Err(e) => differ.push(format!("rebuilt manifest: {e}")),
@@ -893,7 +1020,7 @@ mod tests {
         for date in ["2026-11-21", "2026-11-22"] {
             let r = verify_day(&root.join(date), &VerifyOptions::default());
             assert_eq!(r.outcome(), Outcome::Pass, "{date}\n{r}");
-            assert_eq!(r.checks.len(), 6);
+            assert_eq!(r.checks.len(), 7);
         }
         let r = verify_day(&root.join("2026-11-22"), &VerifyOptions::default());
         let c = &r.check("continuity").unwrap().detail;

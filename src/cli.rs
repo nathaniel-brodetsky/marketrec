@@ -56,11 +56,18 @@ pub enum Command {
         #[arg(long)]
         scratch: Option<PathBuf>,
     },
-    /// Run performance experiments on a recorded day.
+    /// Measure the decode path on a recorded day: the JSON decoder, the whole pipeline with
+    /// each book, and the book updates alone. Use a release build.
     Bench {
-        /// Directory of one recorded day.
+        /// Directory of one recorded day; its frames/ are read.
         #[arg(long)]
         day: PathBuf,
+        /// Frames to load at most, from the start of the day.
+        #[arg(long, default_value_t = 2_000_000)]
+        max_frames: usize,
+        /// Runs of each measurement; the best counts.
+        #[arg(long, default_value_t = 3)]
+        repeat: usize,
     },
     /// Show the trading rules Binance publishes for a symbol. Uses the network.
     Info {
@@ -115,6 +122,13 @@ pub enum FramesAction {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Compress finished frames files to `.frames.zst`, as the recorder does: each copy is
+    /// read back and compared before the original is removed.
+    Compress {
+        /// A frames file, or a directory searched for `*.frames` files.
+        #[arg(long)]
+        input: PathBuf,
+    },
 }
 
 #[derive(Debug, Args, PartialEq, Eq)]
@@ -141,6 +155,13 @@ pub struct RecordArgs {
     pub rest_url: String,
     #[arg(long, default_value = crate::net::ws::DEFAULT_BASE)]
     pub ws_url: String,
+    /// Keep finished hourly frames files uncompressed.
+    #[arg(long)]
+    pub no_compress: bool,
+    /// Refuse to start, and stop cleanly, below this many GB free on the data disk. Exits
+    /// with 3 in that case, which a service manager can treat as "do not restart".
+    #[arg(long, default_value_t = 2)]
+    pub min_free_gb: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -164,10 +185,13 @@ pub enum CliError {
     Record(crate::record::RecordError),
     Decode(crate::json::DecodeError),
     Convert(crate::tables::convert::ConvertError),
+    Bench(crate::bench::BenchError),
     /// The input contains a damaged record; everything before it was processed.
     Damaged,
     /// `verify` found a failing check; the report says which.
     VerifyFailed,
+    /// Not enough free space on the data disk to record. Exit code 3.
+    LowDisk(String),
 }
 
 impl fmt::Display for CliError {
@@ -181,8 +205,10 @@ impl fmt::Display for CliError {
             CliError::Record(e) => write!(f, "{e}"),
             CliError::Decode(e) => write!(f, "{e}"),
             CliError::Convert(e) => write!(f, "{e}"),
+            CliError::Bench(e) => write!(f, "{e}"),
             CliError::Damaged => write!(f, "the input contains a damaged record"),
             CliError::VerifyFailed => write!(f, "verification failed"),
+            CliError::LowDisk(m) => write!(f, "{m}"),
         }
     }
 }
@@ -229,7 +255,16 @@ pub fn run(command: Command) -> Result<(), CliError> {
             }
             Ok(())
         }
-        Command::Bench { .. } => Err(CliError::NotImplemented("bench")),
+        Command::Bench {
+            day,
+            max_frames,
+            repeat,
+        } => {
+            let opts = crate::bench::BenchOptions { max_frames, repeat };
+            let report = crate::bench::bench_day(&day, &opts).map_err(CliError::Bench)?;
+            println!("{report}");
+            Ok(())
+        }
         Command::Frames { action } => run_frames(action),
         Command::Info { symbol, rest_url } => {
             let info = block_on(rest(&rest_url)?.symbol_info(&symbol))?;
@@ -362,6 +397,10 @@ fn run_record(args: RecordArgs) -> Result<(), CliError> {
     cfg.status_every = std::time::Duration::from_secs(args.status_every.max(1));
     cfg.rest_base = args.rest_url;
     cfg.ws_base = args.ws_url;
+    if args.no_compress {
+        cfg.compress_level = None;
+    }
+    cfg.min_free_bytes = args.min_free_gb.saturating_mul(1_000_000_000);
     eprintln!("recording {}, stop with Ctrl+C", cfg.symbol);
     let summary = record(cfg, |p| match p {
         Progress::Status(s) => eprintln!("{s}"),
@@ -375,8 +414,12 @@ fn run_record(args: RecordArgs) -> Result<(), CliError> {
             );
         }
         Progress::Fatal(m) => eprintln!("FATAL: {m}"),
+        Progress::Stopping(m) => eprintln!("STOPPING: {m}"),
     })
-    .map_err(CliError::Record)?;
+    .map_err(|e| match e {
+        e @ crate::record::RecordError::LowDisk { .. } => CliError::LowDisk(e.to_string()),
+        e => CliError::Record(e),
+    })?;
     print!("{summary}");
     if let Some(first) = summary.files.first() {
         println!(
@@ -384,7 +427,21 @@ fn run_record(args: RecordArgs) -> Result<(), CliError> {
             first.display()
         );
     }
-    Ok(())
+    match summary.low_disk {
+        Some(why) => Err(CliError::LowDisk(why)),
+        None => Ok(()),
+    }
+}
+
+impl CliError {
+    /// The process exit code: 3 for a full disk, which a service manager should not answer
+    /// with a restart; 1 for everything else.
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            CliError::LowDisk(_) => 3,
+            _ => 1,
+        }
+    }
 }
 
 fn run_replay(input: &std::path::Path, events: bool) -> Result<(), CliError> {
@@ -407,7 +464,7 @@ fn run_frames(action: FramesAction) -> Result<(), CliError> {
     use crate::frames::text;
     match action {
         FramesAction::Dump { input, output } => {
-            let src = BufReader::new(File::open(&input)?);
+            let src = crate::frames::zst::open(&input)?;
             let n = match output {
                 Some(path) => {
                     let mut out = BufWriter::new(File::create_new(&path)?);
@@ -427,6 +484,38 @@ fn run_frames(action: FramesAction) -> Result<(), CliError> {
         FramesAction::Pack { input, output } => {
             let n = text::pack_file(BufReader::new(File::open(&input)?), &output)?;
             eprintln!("{n} records written to {}", output.display());
+        }
+        FramesAction::Compress { input } => {
+            let files: Vec<PathBuf> = crate::tables::convert::input_files(&input)?
+                .into_iter()
+                .filter(|p| p.extension().is_some_and(|e| e == "frames"))
+                .collect();
+            let (mut raw, mut zst, mut failed) = (0u64, 0u64, 0usize);
+            for f in &files {
+                match crate::frames::zst::compress_file(f, crate::frames::zst::LEVEL) {
+                    Ok(c) => {
+                        raw += c.raw_bytes;
+                        zst += c.compressed_bytes;
+                        println!("{}", c.path.display());
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        eprintln!("{}: {e}", f.display());
+                    }
+                }
+            }
+            eprintln!(
+                "compressed {} of {} files: {:.1} MB to {:.1} MB",
+                files.len() - failed,
+                files.len(),
+                raw as f64 / 1e6,
+                zst as f64 / 1e6
+            );
+            if failed > 0 {
+                return Err(CliError::Io(io::Error::other(format!(
+                    "{failed} files not compressed"
+                ))));
+            }
         }
     }
     Ok(())
@@ -513,6 +602,33 @@ mod tests {
     }
 
     #[test]
+    fn frames_compress_compresses_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gap.jsonl");
+        let bin = dir.path().join("00-00-00.frames");
+        run(Command::Frames {
+            action: FramesAction::Pack {
+                input: src,
+                output: bin.clone(),
+            },
+        })
+        .unwrap();
+        let before = crate::replay::replay_file(&bin).unwrap();
+        run(parse(&[
+            "marketrec",
+            "frames",
+            "compress",
+            "--input",
+            dir.path().to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(!bin.exists());
+        let after = crate::replay::replay_file(&dir.path().join("00-00-00.frames.zst")).unwrap();
+        assert_eq!(after.stats, before.stats);
+        assert_eq!(after.events, before.events);
+    }
+
+    #[test]
     fn convert_takes_input_and_output() {
         assert_eq!(
             parse(&["marketrec", "convert", "--input", "a", "--out", "b"]),
@@ -525,9 +641,18 @@ mod tests {
     }
 
     #[test]
-    fn stubs_say_what_is_missing() {
-        let err = run(parse(&["marketrec", "bench", "--day", "x"])).unwrap_err();
-        assert_eq!(err.to_string(), "`bench` is not implemented yet");
+    fn bench_defaults_and_a_missing_day() {
+        let cmd = parse(&["marketrec", "bench", "--day", "/nonexistent/2026-11-21"]);
+        assert!(matches!(
+            cmd,
+            Command::Bench {
+                max_frames: 2_000_000,
+                repeat: 3,
+                ..
+            }
+        ));
+        let err = run(cmd).unwrap_err();
+        assert!(err.to_string().contains("no frames files"), "{err}");
     }
 
     #[test]

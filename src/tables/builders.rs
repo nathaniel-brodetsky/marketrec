@@ -81,12 +81,21 @@ struct Quality {
 }
 
 #[derive(Default)]
+struct Rtt {
+    recv_ts: Int64Builder,
+    conn: Int64Builder,
+    rtt_ns: Int64Builder,
+    source: StringBuilder,
+}
+
+#[derive(Default)]
 pub(super) struct Builders {
     depth: Depth,
     ticker: Ticker,
     trades: Trades,
     l20: L20Columns,
     quality: Quality,
+    rtt: Rtt,
 }
 
 /// One `book_l20` row being filled: call `side` for bids (0) and asks (1), then `finish`.
@@ -119,6 +128,7 @@ impl Builders {
             Table::Trades => self.trades.recv_ts.len(),
             Table::BookL20 => self.l20.source.len(),
             Table::Quality => self.quality.ts.len(),
+            Table::LinkRtt => self.rtt.recv_ts.len(),
         }
     }
 
@@ -185,6 +195,15 @@ impl Builders {
                     Arc::new(b.source.finish()),
                 ]
             }
+            Table::LinkRtt => {
+                let b = &mut self.rtt;
+                vec![
+                    Arc::new(b.recv_ts.finish()),
+                    Arc::new(b.conn.finish()),
+                    Arc::new(b.rtt_ns.finish()),
+                    Arc::new(b.source.finish()),
+                ]
+            }
         };
         RecordBatch::try_new(table.schema(), columns)
     }
@@ -242,6 +261,14 @@ impl Builders {
         b.ts.append_value(ts);
         b.kind.append_value(kind);
         b.detail.append_value(detail);
+        b.source.append_value(source);
+    }
+
+    pub fn rtt(&mut self, recv_ts: i64, conn: u64, rtt_ns: i64, source: &str) {
+        let b = &mut self.rtt;
+        b.recv_ts.append_value(recv_ts);
+        b.conn.append_value(id(conn));
+        b.rtt_ns.append_value(rtt_ns);
         b.source.append_value(source);
     }
 

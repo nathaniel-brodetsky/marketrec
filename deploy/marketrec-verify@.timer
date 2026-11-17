@@ -1,0 +1,11 @@
+# Every day at 00:30 UTC, verify the day before:
+#   systemctl enable --now marketrec-verify@BTCUSDT.timer
+[Unit]
+Description=marketrec: verify yesterday's recording of %i every day
+
+[Timer]
+OnCalendar=*-*-* 00:30:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

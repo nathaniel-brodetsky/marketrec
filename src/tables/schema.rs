@@ -18,15 +18,17 @@ pub enum Table {
     Trades,
     BookL20,
     Quality,
+    LinkRtt,
 }
 
 impl Table {
-    pub const ALL: [Table; 5] = [
+    pub const ALL: [Table; 6] = [
         Table::DepthDiff,
         Table::BookTicker,
         Table::Trades,
         Table::BookL20,
         Table::Quality,
+        Table::LinkRtt,
     ];
 
     /// Directory name inside a day directory.
@@ -37,6 +39,7 @@ impl Table {
             Table::Trades => "trades",
             Table::BookL20 => "book_l20",
             Table::Quality => "quality",
+            Table::LinkRtt => "link_rtt",
         }
     }
 
@@ -98,6 +101,7 @@ impl Table {
                 Field::new("detail", DataType::Utf8, false),
                 source,
             ],
+            Table::LinkRtt => vec![i64f("recv_ts"), i64f("conn"), i64f("rtt_ns"), source],
         };
         Arc::new(Schema::new(fields))
     }

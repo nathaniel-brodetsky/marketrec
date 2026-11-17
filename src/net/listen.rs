@@ -81,7 +81,7 @@ pub async fn listen(cfg: WsConfig, duration: Duration) -> ListenSummary {
                         .or_default() += 1;
                 }
             }
-            FrameKind::Snapshot | FrameKind::Overflow => {}
+            FrameKind::Snapshot | FrameKind::Overflow | FrameKind::Rtt => {}
         }
     }
     let _ = session.await;

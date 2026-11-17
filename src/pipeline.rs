@@ -16,6 +16,7 @@ use crate::event::{BookTicker, DepthDiff, Event, Level, Trade};
 use crate::frames::{Frame, FrameKind, Header};
 use crate::json::JsonDecoder;
 use crate::sync::{Action, BookSync, DiffOutcome, Quality, State, SyncConfig};
+use crate::timing::{LagChange, LateTracker, MsHistogram};
 
 /// Data-quality events, in the order they happen.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,11 +58,22 @@ pub enum QualityEvent {
     ServerShutdown {
         shutdown_ts: i64,
     },
+    /// A depth update arrived more than a second after its exchange time: the book may be
+    /// valid but is behind the market (`crate::timing`).
+    Late {
+        lag_ns: i64,
+    },
+    /// Updates arrive within half a second again.
+    OnTime {
+        lag_ns: i64,
+        late_for_ns: i64,
+        max_lag_ns: i64,
+    },
 }
 
 impl QualityEvent {
     /// Every kind, in the order `SCHEMA.md` lists them.
-    pub const KINDS: [&'static str; 14] = [
+    pub const KINDS: [&'static str; 16] = [
         "connected",
         "disconnected",
         "gap",
@@ -76,6 +88,8 @@ impl QualityEvent {
         "undecodable",
         "snapshot_failed",
         "server_shutdown",
+        "late",
+        "on_time",
     ];
 
     /// Short stable name, the vocabulary of the quality journal.
@@ -95,6 +109,8 @@ impl QualityEvent {
             QualityEvent::Undecodable { .. } => "undecodable",
             QualityEvent::SnapshotFailed { .. } => "snapshot_failed",
             QualityEvent::ServerShutdown { .. } => "server_shutdown",
+            QualityEvent::Late { .. } => "late",
+            QualityEvent::OnTime { .. } => "on_time",
         }
     }
 }
@@ -142,6 +158,18 @@ impl std::fmt::Display for QualityEvent {
             }
             QualityEvent::SnapshotFailed { id, reason } => write!(f, " id={id} reason={reason:?}"),
             QualityEvent::ServerShutdown { shutdown_ts } => write!(f, " shutdown_ts={shutdown_ts}"),
+            QualityEvent::Late { lag_ns } => write!(f, " lag_ms={}", lag_ns / 1_000_000),
+            QualityEvent::OnTime {
+                lag_ns,
+                late_for_ns,
+                max_lag_ns,
+            } => write!(
+                f,
+                " lag_ms={} late_for_ms={} max_lag_ms={}",
+                lag_ns / 1_000_000,
+                late_for_ns / 1_000_000,
+                max_lag_ns / 1_000_000
+            ),
         }
     }
 }
@@ -155,8 +183,21 @@ pub trait Sink {
     fn book_ticker(&mut self, _recv_ts: i64, _ticker: &BookTicker) {}
     fn trade(&mut self, _recv_ts: i64, _trade: &Trade) {}
     fn quality(&mut self, _recv_ts: i64, _event: &QualityEvent) {}
-    /// After every frame: whether a stream connection is open, and the book if it is valid.
-    fn after_frame(&mut self, _recv_ts: i64, _connected: bool, _book: Option<&dyn OrderBook>) {}
+    /// A message was dropped: another connection had delivered it first.
+    fn duplicate(&mut self, _recv_ts: i64) {}
+    /// A round-trip probe came back on connection `conn` (`crate::timing`).
+    fn rtt(&mut self, _recv_ts: i64, _conn: u64, _rtt_ns: i64) {}
+    /// After every frame: the link's state, and the book if it is valid.
+    fn after_frame(&mut self, _recv_ts: i64, _state: FrameState, _book: Option<&dyn OrderBook>) {}
+}
+
+/// The link after a frame, for time accounting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FrameState {
+    /// A stream connection is open.
+    pub connected: bool,
+    /// Its data arrives more than a second late (`crate::timing`).
+    pub late: bool,
 }
 
 /// Counters for one run. Times are local receive times in nanoseconds.
@@ -185,6 +226,18 @@ pub struct Stats {
     pub last_ts: Option<i64>,
     /// Time with a valid book, between the first and the last frame.
     pub synced_ns: i64,
+    /// Lag of every depth update behind its exchange time.
+    pub lag: MsHistogram,
+    /// The lag of the latest depth update.
+    pub last_lag_ns: Option<i64>,
+    /// `late` intervals and the time in them.
+    pub late_intervals: u64,
+    pub late_ns: i64,
+    /// Round trips of the recorder's own pings, and the latest one.
+    pub rtt: MsHistogram,
+    pub last_rtt_ns: Option<i64>,
+    /// Messages dropped because another connection had delivered them first.
+    pub duplicates: u64,
 }
 
 impl Stats {
@@ -226,7 +279,41 @@ pub struct Pipeline<B: OrderBook> {
     /// The book has been valid on the current connection.
     synced_on_connection: bool,
     /// The connection that delivers data now.
-    connected: Option<u64>,
+    lines: Lines,
+    late: LateTracker,
+}
+
+/// The connections that deliver data, and how far each kind of message has come, to drop
+/// the copies one connection delivers of what another already did. While a new connection
+/// takes over from an old one both deliver the same stream for a while; whichever brings a
+/// message first wins. Messages on one connection are never dropped, so a single connection
+/// works as if this were not here.
+#[derive(Debug, Default)]
+struct Lines {
+    open: Vec<u64>,
+    /// Highest ID forwarded, and on which connection: final update ID of depth updates,
+    /// trade ID, update ID of book tickers.
+    depth: Option<(u64, u64)>,
+    trade: Option<(u64, u64)>,
+    ticker: Option<(u64, u64)>,
+}
+
+impl Lines {
+    /// Whether the message `id` on `conn` is new: not one another connection delivered.
+    fn admit(mark: &mut Option<(u64, u64)>, conn: u64, id: u64) -> bool {
+        match *mark {
+            Some((max, by)) if by != conn && id <= max => false,
+            Some((max, _)) if id <= max => true,
+            _ => {
+                *mark = Some((id, conn));
+                true
+            }
+        }
+    }
+
+    fn is_open(&self, conn: u64) -> bool {
+        self.open.contains(&conn)
+    }
 }
 
 impl<B: OrderBook> Pipeline<B> {
@@ -248,7 +335,8 @@ impl<B: OrderBook> Pipeline<B> {
             stats: Stats::default(),
             synced_since: None,
             synced_on_connection: false,
-            connected: None,
+            lines: Lines::default(),
+            late: LateTracker::default(),
         }
     }
 
@@ -271,6 +359,9 @@ impl<B: OrderBook> Pipeline<B> {
         if let (Some(since), Some(last)) = (self.synced_since, s.last_ts) {
             s.synced_ns += elapsed(since, last);
         }
+        if let (Some(since), Some(last)) = (self.late.since(), s.last_ts) {
+            s.late_ns += elapsed(since, last);
+        }
         s
     }
 
@@ -282,13 +373,26 @@ impl<B: OrderBook> Pipeline<B> {
         self.actions.clear();
         self.sync.set_clock(u64::try_from(ts).unwrap_or(0));
         match frame.kind {
-            FrameKind::Text => self.on_text(ts, frame.payload, sink),
+            FrameKind::Text => {
+                // a connection that delivers data is open, even if a replay began after it
+                // opened
+                if !self.lines.is_open(frame.aux) {
+                    self.lines.open.push(frame.aux);
+                }
+                self.on_text(ts, frame.aux, frame.payload, sink)
+            }
             FrameKind::Snapshot => self.on_snapshot(ts, frame.aux, frame.payload, sink),
             FrameKind::Connected => {
-                self.connected = Some(frame.aux);
-                self.synced_on_connection = false;
                 sink.quality(ts, &QualityEvent::Connected { conn: frame.aux });
-                self.sync.on_connected(&mut self.actions);
+                if self.lines.open.is_empty() {
+                    self.end_late(ts);
+                    self.synced_on_connection = false;
+                    self.sync.on_connected(&mut self.actions);
+                }
+                // with another connection open this one takes over: the book carries on
+                if !self.lines.is_open(frame.aux) {
+                    self.lines.open.push(frame.aux);
+                }
             }
             FrameKind::Disconnected => {
                 let reason = String::from_utf8_lossy(frame.payload).into_owned();
@@ -299,9 +403,12 @@ impl<B: OrderBook> Pipeline<B> {
                         reason,
                     },
                 );
-                // a failed connection attempt never delivered data: nothing to rebuild
-                if self.connected == Some(frame.aux) {
-                    self.connected = None;
+                // a failed connection attempt never delivered data, and while another
+                // connection is open the book carries on with it: nothing to rebuild
+                let was_open = self.lines.is_open(frame.aux);
+                self.lines.open.retain(|&c| c != frame.aux);
+                if was_open && self.lines.open.is_empty() {
+                    self.end_late(ts);
                     if frame.payload == crate::net::ws::STOPPED.as_bytes() {
                         self.sync.on_stop(); // the end of a recording is not a lost connection
                     } else {
@@ -320,6 +427,25 @@ impl<B: OrderBook> Pipeline<B> {
                     },
                 );
             }
+            FrameKind::Rtt => match <[u8; 8]>::try_from(frame.payload) {
+                Ok(sent) => {
+                    let rtt = ts - i64::from_le_bytes(sent);
+                    self.stats.rtt.record(rtt);
+                    self.stats.last_rtt_ns = Some(rtt);
+                    sink.rtt(ts, frame.aux, rtt);
+                }
+                Err(_) => {
+                    self.stats.undecodable += 1;
+                    let reason = format!("rtt payload of {} bytes, not 8", frame.payload.len());
+                    sink.quality(
+                        ts,
+                        &QualityEvent::Undecodable {
+                            kind: FrameKind::Rtt,
+                            reason,
+                        },
+                    );
+                }
+            },
             FrameKind::Overflow => {
                 self.stats.overflow_frames += frame.aux;
                 self.sync.on_overflow(frame.aux, &mut self.actions);
@@ -327,7 +453,18 @@ impl<B: OrderBook> Pipeline<B> {
         }
         self.drain_actions(ts, sink);
         let book = (self.sync.state() == State::Synced).then(|| self.sync.book() as &dyn OrderBook);
-        sink.after_frame(ts, self.connected.is_some(), book);
+        let state = FrameState {
+            connected: !self.lines.open.is_empty(),
+            late: self.late.is_late(),
+        };
+        sink.after_frame(ts, state, book);
+    }
+
+    /// The connection ended or a new one began: a late interval ends with it.
+    fn end_late(&mut self, ts: i64) {
+        if let Some(since) = self.late.end() {
+            self.stats.late_ns += elapsed(since, ts);
+        }
     }
 
     /// Close the run: count the time since the last change of state up to the last frame.
@@ -335,18 +472,35 @@ impl<B: OrderBook> Pipeline<B> {
         if let (Some(since), Some(last)) = (self.synced_since.take(), self.stats.last_ts) {
             self.stats.synced_ns += elapsed(since, last);
         }
+        if let (Some(since), Some(last)) = (self.late.end(), self.stats.last_ts) {
+            self.stats.late_ns += elapsed(since, last);
+        }
         &self.stats
     }
 
-    fn on_text(&mut self, ts: i64, payload: &[u8], sink: &mut impl Sink) {
+    fn on_text(&mut self, ts: i64, conn: u64, payload: &[u8], sink: &mut impl Sink) {
         let Self {
             decoder,
             sync,
             actions,
             stats,
+            late,
+            lines,
             ..
         } = self;
-        match decoder.decode(payload) {
+        let event = decoder.decode(payload);
+        let new = match &event {
+            Ok(Event::Depth(d)) => Lines::admit(&mut lines.depth, conn, d.final_update_id),
+            Ok(Event::Trade(t)) => Lines::admit(&mut lines.trade, conn, t.trade_id),
+            Ok(Event::BookTicker(t)) => Lines::admit(&mut lines.ticker, conn, t.update_id),
+            _ => true,
+        };
+        if !new {
+            stats.duplicates += 1;
+            sink.duplicate(ts);
+            return;
+        }
+        match event {
             Err(e) => {
                 stats.undecodable += 1;
                 sink.quality(
@@ -367,6 +521,31 @@ impl<B: OrderBook> Pipeline<B> {
                     DiffOutcome::Resync => {}
                 }
                 sink.depth(ts, diff, outcome);
+                let lag = ts - diff.event_ts;
+                stats.lag.record(lag);
+                stats.last_lag_ns = Some(lag);
+                match late.on_update(ts, lag) {
+                    Some(LagChange::Late { lag_ns }) => {
+                        stats.late_intervals += 1;
+                        sink.quality(ts, &QualityEvent::Late { lag_ns });
+                    }
+                    Some(LagChange::OnTime {
+                        lag_ns,
+                        late_for_ns,
+                        max_lag_ns,
+                    }) => {
+                        stats.late_ns += late_for_ns;
+                        sink.quality(
+                            ts,
+                            &QualityEvent::OnTime {
+                                lag_ns,
+                                late_for_ns,
+                                max_lag_ns,
+                            },
+                        );
+                    }
+                    None => {}
+                }
                 if outcome == DiffOutcome::Applied {
                     self.check_pending_ticker(ts, sink);
                 }
@@ -704,6 +883,12 @@ mod tests {
                 reason: String::new(),
             },
             QualityEvent::ServerShutdown { shutdown_ts: 1 },
+            QualityEvent::Late { lag_ns: 1 },
+            QualityEvent::OnTime {
+                lag_ns: 1,
+                late_for_ns: 1,
+                max_lag_ns: 1,
+            },
         ];
         let kinds: Vec<&str> = all.iter().map(QualityEvent::kind).collect();
         assert_eq!(kinds, QualityEvent::KINDS);
@@ -781,8 +966,8 @@ mod tests {
         assert_eq!(after(&part_log.0), after(&full_log.0));
         assert_eq!(
             part.stats().reconnects,
-            0,
-            "the replay saw no connection end"
+            1,
+            "connection 1 delivered data in the replay, so the replay saw it end"
         );
     }
 
@@ -799,6 +984,244 @@ mod tests {
             "from the snapshot at 30 to 100"
         );
         assert_eq!(p.finish().synced_ns, 70);
+    }
+
+    #[test]
+    fn late_and_on_time_follow_the_lag_of_depth_updates() {
+        const SEC: i64 = 1_000_000_000;
+        const MS: i64 = 1_000_000;
+        // a depth update received at `ts` that the exchange stamped `lag` earlier (in ms)
+        let d = |ts: i64, lag: i64, id: u64| {
+            text(
+                ts,
+                format!(
+                    r#"{{"stream":"btcusdt@depth@100ms","data":{{"e":"depthUpdate","E":{},"s":"BTCUSDT","U":{id},"u":{id},"b":[],"a":[]}}}}"#,
+                    (ts - lag) / MS
+                ),
+            )
+        };
+        let frames = vec![
+            link(FrameKind::Connected, 0, 1, "wss://example"),
+            d(SEC, 100 * MS, 1),
+            d(2 * SEC, 1500 * MS, 2),
+            d(3 * SEC, 3000 * MS, 3),
+            d(4 * SEC, 700 * MS, 4), // between the thresholds: still late
+            d(5 * SEC, 200 * MS, 5),
+            d(6 * SEC, 2000 * MS, 6),
+            link(FrameKind::Disconnected, 8 * SEC, 1, "connection reset"),
+        ];
+        let (p, log) = run(&frames);
+        let quality: Vec<&String> = log
+            .0
+            .iter()
+            .filter(|l| l.contains("Late") || l.contains("OnTime"))
+            .collect();
+        assert_eq!(
+            quality,
+            [
+                "quality@2000000000 Late { lag_ns: 1500000000 }",
+                "quality@5000000000 OnTime { lag_ns: 200000000, late_for_ns: 3000000000, max_lag_ns: 3000000000 }",
+                "quality@6000000000 Late { lag_ns: 2000000000 }",
+            ]
+        );
+        let s = p.stats();
+        assert_eq!(s.late_intervals, 2);
+        assert_eq!(
+            s.late_ns,
+            3 * SEC + 2 * SEC,
+            "the second ends with its connection"
+        );
+        assert_eq!(s.lag.count(), 6);
+        assert_eq!(s.lag.max_ns, 3000 * MS);
+        assert_eq!(s.last_lag_ns, Some(2000 * MS));
+
+        // a late interval still running is counted by stats_so_far, and by finish
+        let mut p = Pipeline::new(&header(), RefBook::new(), SyncConfig::default()).unwrap();
+        for f in &frames[..7] {
+            p.on_frame(f.as_frame(), &mut Log::default());
+        }
+        assert_eq!(p.stats().late_ns, 3 * SEC);
+        assert_eq!(p.stats_so_far().late_ns, 3 * SEC);
+        p.on_frame(d(7 * SEC, 1500 * MS, 7).as_frame(), &mut Log::default());
+        assert_eq!(p.stats_so_far().late_ns, 4 * SEC);
+        assert_eq!(p.finish().late_ns, 4 * SEC);
+        assert_eq!(
+            QualityEvent::OnTime {
+                lag_ns: 200 * MS,
+                late_for_ns: 3 * SEC,
+                max_lag_ns: 3 * SEC
+            }
+            .to_string(),
+            "on_time lag_ms=200 late_for_ms=3000 max_lag_ms=3000"
+        );
+    }
+
+    /// A depth message: `U`, `u`, bids and asks.
+    type DepthMsg = (u64, u64, Vec<(i64, i64)>, Vec<(i64, i64)>);
+
+    /// A frame on connection `conn`.
+    fn on(conn: u64, mut f: OwnedFrame) -> OwnedFrame {
+        f.aux = conn;
+        f
+    }
+
+    #[test]
+    fn a_second_connection_takes_over_without_touching_the_book() {
+        let mut frames = normal_start(); // connection 1, synced at 102, book at 105
+        frames.push(link(FrameKind::Connected, 101, 2, "wss://example"));
+        frames.push(on(2, depth(102, 104, 105, &[], &[(10100, 0)]))); // copy of what 1 sent
+        frames.push(on(2, depth(103, 106, 107, &[(9960, 2)], &[]))); // 2 is ahead now
+        frames.push(on(1, depth(104, 106, 107, &[(9960, 2)], &[]))); // the copy from 1
+        frames.push(on(2, trade(105, 7))); // a copy of the trade 1 delivered at 35
+        frames.push(on(2, trade(106, 8)));
+        frames.push(on(1, trade(107, 8)));
+        frames.push(link(FrameKind::Disconnected, 110, 1, "handover"));
+        frames.push(on(2, depth(120, 108, 108, &[(9970, 1)], &[])));
+        let (p, log) = run(&frames);
+        assert_eq!(p.state(), State::Synced);
+        assert_eq!(p.book().update_id(), 108);
+        let s = p.stats();
+        assert_eq!((s.reconnects, s.resyncs, s.gaps), (0, 0, 0));
+        assert_eq!(s.duplicates, 4, "two depth copies, two trade copies");
+        let depth: Vec<&String> = log.0.iter().filter(|l| l.starts_with("depth 10")).collect();
+        assert_eq!(
+            depth,
+            [
+                "depth 101-102 Buffered",
+                "depth 103-104 Applied",
+                "depth 105-105 Applied",
+                "depth 106-107 Applied",
+                "depth 108-108 Applied"
+            ],
+            "every update once"
+        );
+        let trades: Vec<&String> = log.0.iter().filter(|l| l.starts_with("trade")).collect();
+        assert_eq!(trades, ["trade 7", "trade 8"]);
+        assert!(!log.0.iter().any(|l| l.contains("Reconnect")));
+
+        // the last connection closing is a lost connection as before
+        frames.push(link(FrameKind::Disconnected, 130, 2, "reset"));
+        let (p, _) = run(&frames);
+        assert_eq!((p.stats().reconnects, p.state()), (1, State::Resyncing));
+    }
+
+    proptest! {
+        /// Two connections deliver the same updates, each in order and complete, batched
+        /// differently and interleaved in any way: the book equals the exchange's, every
+        /// update counts once, and no gap is ever seen.
+        #[test]
+        fn two_copies_of_the_stream_make_one_book(
+            updates in proptest::collection::vec((any::<bool>(), 0i64..40, 0i64..4), 1..60),
+            cuts_a in proptest::collection::vec(any::<bool>(), 60),
+            cuts_b in proptest::collection::vec(any::<bool>(), 60),
+            order in proptest::collection::vec(any::<bool>(), 120),
+        ) {
+            // the exchange: the snapshot book at 100, then updates 101, 102, ...
+            let mut truth: [std::collections::BTreeMap<i64, i64>; 2] =
+                [[(9900, 5), (9800, 7)].into(), [(10100, 2), (10200, 3)].into()];
+            let level = |&(bid, off, q): &(bool, i64, i64)| {
+                if bid { (0usize, 9000 + off * 10, q) } else { (1usize, 10300 + off * 10, q) }
+            };
+            for u in &updates {
+                let (side, price, q) = level(u);
+                if q == 0 { truth[side].remove(&price); } else { truth[side].insert(price, q); }
+            }
+            // one connection's messages: consecutive updates batched where `cuts` says,
+            // each batch carrying the final quantity of every level it changed
+            let batches = |cuts: &[bool]| -> Vec<DepthMsg> {
+                let mut out = Vec::new();
+                let mut start = 0;
+                for i in 0..updates.len() {
+                    if i + 1 == updates.len() || cuts[i] {
+                        let mut sides = [std::collections::BTreeMap::new(), std::collections::BTreeMap::new()];
+                        for u in &updates[start..=i] {
+                            let (side, price, q) = level(u);
+                            sides[side].insert(price, q);
+                        }
+                        let [b, a] = sides;
+                        out.push((101 + start as u64, 101 + i as u64, b.into_iter().collect(), a.into_iter().collect()));
+                        start = i + 1;
+                    }
+                }
+                out
+            };
+            let (a, b) = (batches(&cuts_a), batches(&cuts_b));
+            let mut frames = vec![
+                link(FrameKind::Connected, 1, 1, "wss://example"),
+                on(1, depth(10, 100, 100, &[], &[])),
+                snapshot(11, 10, 100),
+                link(FrameKind::Connected, 12, 2, "wss://example"),
+            ];
+            let (mut ia, mut ib, mut ts) = (0, 0, 20);
+            for &take_a in order.iter().chain(std::iter::repeat(&true)) {
+                let (conn, list, i) = match (take_a, ia < a.len(), ib < b.len()) {
+                    (_, false, false) => break,
+                    (true, true, _) | (false, true, false) => (1, &a, &mut ia),
+                    _ => (2, &b, &mut ib),
+                };
+                let (first, last, bids, asks) = &list[*i];
+                *i += 1;
+                frames.push(on(conn, depth(ts, *first, *last, bids, asks)));
+                ts += 1;
+            }
+            let (p, log) = run(&frames);
+            prop_assert_eq!(p.state(), State::Synced, "{:?}", log.0);
+            prop_assert_eq!(p.stats().gaps, 0);
+            prop_assert_eq!(p.book().update_id(), 100 + updates.len() as u64);
+            for (side, s) in [Side::Bid, Side::Ask].into_iter().enumerate() {
+                let mut got = Vec::new();
+                p.book().top(s, 1000, &mut got);
+                let mut want: Vec<Level> = truth[side].iter().map(|(&price, &qty)| Level { price, qty }).collect();
+                if side == 0 { want.reverse(); }
+                prop_assert_eq!(got, want);
+            }
+            // each update forwarded once: the final IDs of what reached the sink only grow
+            let finals: Vec<u64> = log
+                .0
+                .iter()
+                .filter_map(|l| l.strip_prefix("depth "))
+                .map(|l| l.split(['-', ' ']).nth(1).unwrap().parse().unwrap())
+                .collect();
+            prop_assert!(finals.windows(2).all(|w| w[0] < w[1]), "{:?}", finals);
+            prop_assert_eq!(
+                p.stats().depth + p.stats().duplicates,
+                1 + (a.len() + b.len()) as u64,
+                "every message is either forwarded or dropped as a copy"
+            );
+        }
+    }
+
+    #[test]
+    fn the_fast_book_gives_the_reference_result_on_a_long_session() {
+        use crate::book::LadderBook;
+        use crate::testkit::{DAY0, MS, SEC, Session};
+        let mut s = Session::new(31);
+        s.connect(DAY0);
+        s.run(DAY0 + MS, DAY0 + 20 * SEC, 20 * MS);
+        s.lose(2);
+        s.run(DAY0 + 20 * SEC, DAY0 + 40 * SEC, 20 * MS);
+        s.disconnect(DAY0 + 40 * SEC, "reset");
+        s.connect(DAY0 + 41 * SEC);
+        s.run(DAY0 + 41 * SEC + MS, DAY0 + 60 * SEC, 20 * MS);
+        let h = crate::testkit::header();
+        let (mut a, mut b) = (
+            Pipeline::new(&h, RefBook::new(), SyncConfig::default()).unwrap(),
+            Pipeline::new(&h, LadderBook::new(), SyncConfig::default()).unwrap(),
+        );
+        let (mut la, mut lb) = (Log::default(), Log::default());
+        for f in &s.frames {
+            a.on_frame(f.as_frame(), &mut la);
+            b.on_frame(f.as_frame(), &mut lb);
+        }
+        assert_eq!(la.0, lb.0);
+        assert_eq!(a.finish(), b.finish());
+        let (mut x, mut y) = (Vec::new(), Vec::new());
+        for side in [Side::Bid, Side::Ask] {
+            a.book().top(side, usize::MAX, &mut x);
+            b.book().top(side, usize::MAX, &mut y);
+            assert_eq!(x, y);
+        }
+        assert!(a.stats().bbo_compared > 100 && a.stats().gaps == 1);
     }
 
     #[test]

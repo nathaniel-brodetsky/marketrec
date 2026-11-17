@@ -1041,6 +1041,7 @@ dependencies = [
  "clap",
  "crc32fast",
  "futures-util",
+ "libc",
  "parquet",
  "proptest",
  "reqwest",
@@ -1050,6 +1051,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-tungstenite",
+ "zstd",
 ]
 
 [[package]]

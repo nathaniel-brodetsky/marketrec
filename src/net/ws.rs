@@ -10,16 +10,20 @@
 //!   minute; tungstenite queues the pong itself and sends it while reading, so reading
 //!   continuously is enough;
 //! - a connection lives at most 24 hours, and a `serverShutdown` event announces an
-//!   earlier closing; on that notice the session reconnects right away;
+//!   earlier closing; in both cases the session connects a successor before the old
+//!   connection goes (make-before-break, see `run`);
 //! - at most 300 connection attempts per 5 minutes per IP: failed attempts back off
 //!   exponentially with jitter, so many clients do not retry in step.
 //!
 //! A connection that goes silent for `stale_after` is treated as dead.
+//!
+//! Every `probe_every` the session sends its own ping with the send time as payload; the
+//! pong comes back as an `rtt` frame, the round trip of the link (`crate::timing`).
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use futures_util::StreamExt;
-use tokio::sync::{mpsc, watch};
+use futures_util::{SinkExt, StreamExt};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::frames::{FrameKind, OwnedFrame};
@@ -110,6 +114,12 @@ impl Backoff {
 pub struct WsConfig {
     pub url: String,
     pub stale_after: Duration,
+    /// Pause between the session's own round-trip pings.
+    pub probe_every: Duration,
+    /// Age at which a connection is replaced, before the exchange's 24-hour limit.
+    pub rotate_after: Duration,
+    /// How long a successor delivers alongside the connection it replaces.
+    pub overlap: Duration,
     pub connect_timeout: Duration,
     pub backoff: BackoffConfig,
     pub seed: u64,
@@ -120,6 +130,9 @@ impl WsConfig {
         Self {
             url,
             stale_after: Duration::from_secs(15),
+            probe_every: PROBE_EVERY,
+            rotate_after: ROTATE_AFTER,
+            overlap: OVERLAP,
             connect_timeout: Duration::from_secs(10),
             backoff: BackoffConfig::default(),
             seed: now_ns() as u64,
@@ -127,118 +140,239 @@ impl WsConfig {
     }
 }
 
+/// Default pause between round-trip pings.
+pub const PROBE_EVERY: Duration = Duration::from_secs(5);
+/// Default age at which a connection is replaced: an hour before Binance's 24-hour limit.
+pub const ROTATE_AFTER: Duration = Duration::from_secs(23 * 3600);
+/// Default time a successor delivers alongside the connection it replaces.
+pub const OVERLAP: Duration = Duration::from_secs(5);
+
 /// How a connection ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum End {
-    /// Reconnect after a backoff pause.
+    /// The link failed: replace it after a backoff pause.
     Failed(String),
-    /// The server announced shutdown: reconnect at once.
-    Planned,
-    /// The caller asked to stop, or nobody reads the frames any more.
-    Stop(String),
+    /// The session closed it: to stop, or because a successor took over.
+    Closed(String),
 }
+
+/// Payload of the `disconnected` frame of a connection closed because its successor took
+/// over.
+pub const HANDOVER: &str = "handover";
 
 const SHUTDOWN_NOTICE: &[u8] = br#"{"stream":"!serverShutdown""#;
 
-/// Run until `stop` becomes true or the receiver of `tx` is dropped. Connection numbers
-/// start at 1 and grow with every attempt.
-pub async fn run(cfg: WsConfig, tx: mpsc::Sender<OwnedFrame>, mut stop: watch::Receiver<bool>) {
-    let mut backoff = Backoff::new(cfg.backoff, cfg.seed);
-    let mut conn = 0u64;
-    loop {
-        if *stop.borrow() {
-            return;
-        }
-        conn += 1;
-        let attempt = tokio::time::timeout(
-            cfg.connect_timeout,
-            tokio_tungstenite::connect_async(cfg.url.as_str()),
-        );
-        let end = tokio::select! {
-            r = attempt => match r {
-                Ok(Ok((ws, _))) => {
-                    if send(&tx, FrameKind::Connected, conn, cfg.url.as_bytes().to_vec()).await.is_err() {
-                        return;
-                    }
-                    let started = Instant::now();
-                    let end = pump(ws, conn, &tx, &mut stop, cfg.stale_after).await;
-                    if started.elapsed() >= cfg.backoff.stable_after {
-                        backoff.reset();
-                    }
-                    end
-                }
-                Ok(Err(e)) => End::Failed(format!("connect failed: {e}")),
-                Err(_) => End::Failed(format!("connect timed out after {:?}", cfg.connect_timeout)),
-            },
-            _ = stop.changed() => End::Stop("stopped while connecting".into()),
-        };
-        let reason = match &end {
-            End::Failed(r) | End::Stop(r) => r.clone(),
-            End::Planned => "server announced shutdown".into(),
-        };
-        if send(&tx, FrameKind::Disconnected, conn, reason.into_bytes())
-            .await
-            .is_err()
-        {
-            return;
-        }
-        match end {
-            End::Stop(_) => return,
-            End::Planned => backoff.reset(),
-            End::Failed(_) => {
-                let pause = backoff.next_delay();
-                tokio::select! {
-                    _ = tokio::time::sleep(pause) => {}
-                    _ = stop.changed() => return,
-                }
-            }
+/// What a connection task tells the session.
+#[derive(Debug)]
+enum LineEvent {
+    Connected,
+    FirstMessage,
+    /// The exchange announced that it will close this connection.
+    Notice,
+    Ended {
+        end: End,
+        lived: Duration,
+    },
+}
+
+/// One connection, as the session sees it.
+struct Line {
+    conn: u64,
+    close: Option<oneshot::Sender<String>>,
+    connected_at: Option<Instant>,
+    first_message_at: Option<Instant>,
+    /// To be replaced: it is near the 24-hour limit or the exchange announced its end.
+    retire: bool,
+}
+
+impl Line {
+    fn close(&mut self, reason: &str) {
+        if let Some(c) = self.close.take() {
+            let _ = c.send(reason.to_owned());
         }
     }
+}
+
+async fn sleep_until(t: Option<Instant>) {
+    match t {
+        Some(t) => tokio::time::sleep_until(t.into()).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Run until `stop` becomes true or the receiver of `tx` is dropped. Connection numbers
+/// start at 1 and grow with every attempt.
+///
+/// A connection is replaced make-before-break: when it nears `rotate_after` or the exchange
+/// announces its end, a successor connects while it keeps delivering, and it is closed
+/// (reason `handover`) once the successor has delivered for `overlap`. Both deliver the
+/// same stream meanwhile; the pipeline keeps the first copy of every message, so the book
+/// carries on without a gap and without a new snapshot. A connection that fails is
+/// replaced after a backoff pause.
+pub async fn run(cfg: WsConfig, tx: mpsc::Sender<OwnedFrame>, mut stop: watch::Receiver<bool>) {
+    let mut backoff = Backoff::new(cfg.backoff, cfg.seed);
+    let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<(u64, LineEvent)>();
+    let mut lines: Vec<Line> = Vec::new();
+    let mut next_conn = 0u64;
+    let mut start_at: Option<Instant> = Some(Instant::now());
+    let mut stopping = *stop.borrow();
+    loop {
+        if stopping || tx.is_closed() {
+            stopping = true;
+            start_at = None;
+            for l in &mut lines {
+                l.close(STOPPED);
+            }
+            if lines.is_empty() {
+                return;
+            }
+        }
+        // a single serving connection retires at its age limit
+        let rotate_at = match lines.as_slice() {
+            [l] if !l.retire => l.connected_at.map(|t| t + cfg.rotate_after),
+            _ => None,
+        };
+        // the retiring connection closes once its successor has delivered for a while
+        let handover_at = match lines.as_slice() {
+            [old, new] if old.retire && old.close.is_some() => {
+                new.first_message_at.map(|t| t + cfg.overlap)
+            }
+            _ => None,
+        };
+        tokio::select! {
+            Some((conn, ev)) = ev_rx.recv() => {
+                let Some(i) = lines.iter().position(|l| l.conn == conn) else { continue };
+                match ev {
+                    LineEvent::Connected => lines[i].connected_at = Some(Instant::now()),
+                    LineEvent::FirstMessage => lines[i].first_message_at = Some(Instant::now()),
+                    LineEvent::Notice => {
+                        lines[i].retire = true;
+                        if lines.len() == 1 && start_at.is_none() {
+                            start_at = Some(Instant::now());
+                        }
+                    }
+                    LineEvent::Ended { end, lived } => {
+                        lines.remove(i);
+                        if lived >= cfg.backoff.stable_after {
+                            backoff.reset();
+                        }
+                        let replace = match lines.as_slice() {
+                            [] => true,
+                            // the successor of a retiring connection failed: try again
+                            [old] => old.retire,
+                            _ => false,
+                        };
+                        if replace && matches!(end, End::Failed(_)) && start_at.is_none() {
+                            start_at = Some(Instant::now() + backoff.next_delay());
+                        }
+                    }
+                }
+            }
+            _ = sleep_until(start_at), if start_at.is_some() => {
+                start_at = None;
+                next_conn += 1;
+                let (close_tx, close_rx) = oneshot::channel();
+                lines.push(Line {
+                    conn: next_conn,
+                    close: Some(close_tx),
+                    connected_at: None,
+                    first_message_at: None,
+                    retire: false,
+                });
+                tokio::spawn(line(next_conn, cfg.clone(), tx.clone(), ev_tx.clone(), close_rx));
+            }
+            _ = sleep_until(rotate_at), if rotate_at.is_some() => {
+                lines[0].retire = true;
+                start_at = Some(Instant::now());
+            }
+            _ = sleep_until(handover_at), if handover_at.is_some() => lines[0].close(HANDOVER),
+            _ = stop.changed() => stopping = true,
+        }
+    }
+}
+
+/// One connection, from the attempt to its `disconnected` frame.
+async fn line(
+    conn: u64,
+    cfg: WsConfig,
+    tx: mpsc::Sender<OwnedFrame>,
+    events: mpsc::UnboundedSender<(u64, LineEvent)>,
+    mut close: oneshot::Receiver<String>,
+) {
+    let mut connected = None;
+    let attempt = tokio::time::timeout(
+        cfg.connect_timeout,
+        tokio_tungstenite::connect_async(cfg.url.as_str()),
+    );
+    let end = tokio::select! {
+        r = attempt => match r {
+            Ok(Ok((ws, _))) => {
+                if send(&tx, FrameKind::Connected, conn, cfg.url.as_bytes().to_vec()).await.is_err() {
+                    End::Closed("frame receiver closed".into())
+                } else {
+                    connected = Some(Instant::now());
+                    let _ = events.send((conn, LineEvent::Connected));
+                    pump(ws, conn, &tx, &mut close, &cfg, &events).await
+                }
+            }
+            Ok(Err(e)) => End::Failed(format!("connect failed: {e}")),
+            Err(_) => End::Failed(format!("connect timed out after {:?}", cfg.connect_timeout)),
+        },
+        _ = &mut close => End::Closed("stopped while connecting".into()),
+    };
+    let reason = match &end {
+        End::Failed(r) | End::Closed(r) => r.clone(),
+    };
+    let _ = send(&tx, FrameKind::Disconnected, conn, reason.into_bytes()).await;
+    let lived = connected.map_or(Duration::ZERO, |t: Instant| t.elapsed());
+    let _ = events.send((conn, LineEvent::Ended { end, lived }));
 }
 
 async fn pump<S>(
     mut ws: tokio_tungstenite::WebSocketStream<S>,
     conn: u64,
     tx: &mpsc::Sender<OwnedFrame>,
-    stop: &mut watch::Receiver<bool>,
-    stale_after: Duration,
+    close: &mut oneshot::Receiver<String>,
+    cfg: &WsConfig,
+    events: &mpsc::UnboundedSender<(u64, LineEvent)>,
 ) -> End
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    let stale_after = cfg.stale_after;
+    let mut last_msg = tokio::time::Instant::now();
+    let mut probe = tokio::time::interval_at(last_msg + cfg.probe_every, cfg.probe_every);
+    probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut first = true;
     loop {
         let next = tokio::select! {
-            r = tokio::time::timeout(stale_after, ws.next()) => r,
-            _ = stop.changed() => {
+            m = ws.next() => m,
+            _ = tokio::time::sleep_until(last_msg + stale_after) => {
+                return End::Failed(format!("stale: no message for {stale_after:?}"));
+            }
+            _ = probe.tick() => {
+                let sent = now_ns().to_le_bytes().to_vec();
+                if let Err(e) = ws.send(Message::Ping(sent.into())).await {
+                    return End::Failed(format!("ping failed: {e}"));
+                }
+                continue;
+            }
+            reason = &mut *close => {
                 let _ = ws.close(None).await;
-                return End::Stop(STOPPED.into());
+                return End::Closed(reason.unwrap_or_else(|_| STOPPED.into()));
             }
         };
+        last_msg = tokio::time::Instant::now();
         let msg = match next {
-            Err(_) => return End::Failed(format!("stale: no message for {stale_after:?}")),
-            Ok(None) => return End::Failed("stream ended".into()),
-            Ok(Some(Err(e))) => return End::Failed(format!("read error: {e}")),
-            Ok(Some(Ok(m))) => m,
+            None => return End::Failed("stream ended".into()),
+            Some(Err(e)) => return End::Failed(format!("read error: {e}")),
+            Some(Ok(m)) => m,
         };
-        match msg {
-            Message::Text(t) => {
-                let planned = t.as_bytes().starts_with(SHUTDOWN_NOTICE);
-                if send(tx, FrameKind::Text, conn, t.as_bytes().to_vec())
-                    .await
-                    .is_err()
-                {
-                    return End::Stop("frame receiver closed".into());
-                }
-                if planned {
-                    let _ = ws.close(None).await;
-                    return End::Planned;
-                }
-            }
-            Message::Binary(b) => {
-                if send(tx, FrameKind::Binary, conn, b.to_vec()).await.is_err() {
-                    return End::Stop("frame receiver closed".into());
-                }
-            }
+        let (kind, payload) = match msg {
+            Message::Text(t) => (FrameKind::Text, t.as_bytes().to_vec()),
+            Message::Binary(b) => (FrameKind::Binary, b.to_vec()),
+            // the answer to our own ping: 8 bytes of send time
+            Message::Pong(p) if p.len() == 8 => (FrameKind::Rtt, p.to_vec()),
             Message::Close(Some(cf)) => {
                 return End::Failed(format!(
                     "closed by server: {} {}",
@@ -247,25 +381,37 @@ where
                 ));
             }
             Message::Close(None) => return End::Failed("closed by server".into()),
-            Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {} // pongs are sent by tungstenite
+            Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => continue, // pongs are sent by tungstenite
+        };
+        let notice = kind == FrameKind::Text && payload.starts_with(SHUTDOWN_NOTICE);
+        if send(tx, kind, conn, payload).await.is_err() {
+            return End::Closed("frame receiver closed".into());
+        }
+        if kind != FrameKind::Rtt && std::mem::take(&mut first) {
+            let _ = events.send((conn, LineEvent::FirstMessage));
+        }
+        if notice {
+            let _ = events.send((conn, LineEvent::Notice));
         }
     }
 }
 
+/// Stamp and queue a frame. The time is taken once room in the queue is reserved, so the
+/// frames of all connections enter the queue in the order of their receive times.
 async fn send(
     tx: &mpsc::Sender<OwnedFrame>,
     kind: FrameKind,
     aux: u64,
     payload: Vec<u8>,
 ) -> Result<(), ()> {
-    tx.send(OwnedFrame {
+    let permit = tx.reserve().await.map_err(|_| ())?;
+    permit.send(OwnedFrame {
         kind,
         recv_ts: now_ns(),
         aux,
         payload,
-    })
-    .await
-    .map_err(|_| ())
+    });
+    Ok(())
 }
 
 #[cfg(test)]
@@ -333,6 +479,8 @@ pub(crate) mod tests {
         /// Accept and say nothing.
         Silent,
         /// Send these messages with a pause between them, then keep the connection open.
+        /// Sends each message, then pauses. `NOW_US` in a text message becomes the time of
+        /// sending in microseconds, as an exchange stamps its events.
         SendSlowlyThenWait(Vec<Message>, Duration),
     }
 
@@ -369,6 +517,12 @@ pub(crate) mod tests {
                         }
                         Script::SendSlowlyThenWait(msgs, pause) => {
                             for m in msgs {
+                                let m = match m {
+                                    Message::Text(t) if t.contains("NOW_US") => Message::text(
+                                        t.replace("NOW_US", &(super::now_ns() / 1000).to_string()),
+                                    ),
+                                    m => m,
+                                };
                                 if ws.send(m).await.is_err() {
                                     return;
                                 }
@@ -407,6 +561,9 @@ pub(crate) mod tests {
         WsConfig {
             url,
             stale_after: Duration::from_millis(300),
+            probe_every: Duration::from_secs(3600),
+            rotate_after: Duration::from_secs(3600),
+            overlap: Duration::from_millis(50),
             connect_timeout: Duration::from_secs(2),
             backoff: BackoffConfig {
                 initial: Duration::from_millis(10),
@@ -509,6 +666,28 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn own_pings_come_back_as_round_trips_and_keep_a_quiet_link_alive() {
+        // the server sends nothing but answers pings: without the probes the link would be
+        // stale after 300 ms
+        let url = server(vec![Script::SendSlowlyThenWait(vec![], Duration::ZERO)]).await;
+        let mut cfg = fast(url);
+        cfg.probe_every = Duration::from_millis(50);
+        let frames = collect(cfg, 7).await;
+        assert_eq!(frames[0].kind, FrameKind::Connected);
+        let rtts: Vec<&OwnedFrame> = frames[1..].iter().collect();
+        assert!(
+            rtts.iter().all(|f| f.kind == FrameKind::Rtt && f.aux == 1),
+            "{:?}",
+            describe(&frames)
+        );
+        for f in rtts {
+            let sent = i64::from_le_bytes(f.payload.as_slice().try_into().unwrap());
+            let rtt = f.recv_ts - sent;
+            assert!((0..100_000_000).contains(&rtt), "local round trip {rtt} ns");
+        }
+    }
+
+    #[tokio::test]
     async fn silent_connection_is_dropped_as_stale() {
         let url = server(vec![
             Script::Silent,
@@ -524,22 +703,145 @@ pub(crate) mod tests {
         assert_eq!(d[3], "text 2 x");
     }
 
+    /// Run a session and collect frames until `done` holds for the last one.
+    async fn collect_until(cfg: WsConfig, done: impl Fn(&OwnedFrame) -> bool) -> Vec<OwnedFrame> {
+        let (tx, mut rx) = mpsc::channel(256);
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(run(cfg, tx, stop_rx));
+        let mut out = Vec::new();
+        while let Ok(Some(f)) = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+            let end = done(&f);
+            out.push(f);
+            if end {
+                break;
+            }
+        }
+        stop_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+        out
+    }
+
+    fn texts(prefix: &str, n: usize) -> Vec<Message> {
+        (1..=n)
+            .map(|i| Message::text(format!("{prefix}{i}")))
+            .collect()
+    }
+
+    fn handover_of(conn: u64) -> impl Fn(&OwnedFrame) -> bool {
+        move |f| {
+            f.kind == FrameKind::Disconnected && f.aux == conn && f.payload == HANDOVER.as_bytes()
+        }
+    }
+
+    /// Index of the first frame described as `what`.
+    fn at(d: &[String], what: &str) -> usize {
+        d.iter()
+            .position(|l| l.starts_with(what))
+            .unwrap_or_else(|| panic!("no {what} in {d:?}"))
+    }
+
     #[tokio::test]
-    async fn server_shutdown_notice_reconnects_at_once() {
+    async fn server_shutdown_notice_brings_a_successor_before_the_old_connection_goes() {
+        let notice = r#"{"stream":"!serverShutdown","data":{"e":"serverShutdown","E":1,"T":2}}"#;
+        let mut first = vec![Message::text(notice)];
+        first.extend(texts("a", 30));
+        let url = server(vec![
+            Script::SendSlowlyThenWait(first, Duration::from_millis(10)),
+            Script::SendSlowlyThenWait(texts("b", 30), Duration::from_millis(10)),
+        ])
+        .await;
+        let mut cfg = fast(url.clone());
+        cfg.backoff.initial = Duration::from_secs(30); // a backoff pause would time the test out
+        cfg.backoff.max = Duration::from_secs(30);
+        let frames = collect_until(cfg, handover_of(1)).await;
+        let d = describe(&frames);
+        assert_eq!(d[1], format!("text 1 {notice}"));
+        let (connected2, first_b, handover) = (
+            at(&d, &format!("connected 2 {url}")),
+            at(&d, "text 2 b1"),
+            d.len() - 1,
+        );
+        assert!(connected2 > 1 && first_b > connected2);
+        assert!(
+            d[connected2..handover]
+                .iter()
+                .any(|l| l.starts_with("text 1 a")),
+            "the old connection kept delivering after its successor connected: {d:?}"
+        );
+        assert!(
+            !d[..handover].iter().any(|l| l.starts_with("disconnected")),
+            "{d:?}"
+        );
+        let overlap = frames[handover].recv_ts - frames[first_b].recv_ts;
+        assert!(
+            overlap >= 50_000_000,
+            "closed {overlap} ns after the successor delivered"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connection_is_replaced_at_its_age_limit_without_a_break() {
+        let url = server(vec![
+            Script::SendSlowlyThenWait(texts("a", 40), Duration::from_millis(10)),
+            Script::SendSlowlyThenWait(texts("b", 40), Duration::from_millis(10)),
+        ])
+        .await;
+        let mut cfg = fast(url);
+        cfg.rotate_after = Duration::from_millis(120);
+        cfg.stale_after = Duration::from_secs(5);
+        let frames = collect_until(cfg, handover_of(1)).await;
+        let d = describe(&frames);
+        let (c1, c2) = (at(&d, "connected 1"), at(&d, "connected 2"));
+        let age = frames[c2].recv_ts - frames[c1].recv_ts;
+        assert!(age >= 120_000_000, "replaced after {age} ns");
+        assert!(
+            !d[..d.len() - 1]
+                .iter()
+                .any(|l| l.starts_with("disconnected")),
+            "{d:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_successor_is_tried_again_while_the_old_connection_serves() {
+        let notice = r#"{"stream":"!serverShutdown","data":{"e":"serverShutdown","E":1,"T":2}}"#;
+        let mut first = vec![Message::text(notice)];
+        first.extend(texts("a", 40));
+        let url = server(vec![
+            Script::SendSlowlyThenWait(first, Duration::from_millis(10)),
+            Script::SendThenClose(vec![], "busy"),
+            Script::SendSlowlyThenWait(texts("c", 40), Duration::from_millis(10)),
+        ])
+        .await;
+        let frames = collect_until(fast(url), handover_of(1)).await;
+        let d = describe(&frames);
+        let failed = at(&d, "disconnected 2 closed by server: 1001 busy");
+        let c3 = at(&d, "connected 3");
+        assert!(failed < c3);
+        assert!(
+            !d[..d.len() - 1]
+                .iter()
+                .any(|l| l.starts_with("disconnected 1")),
+            "connection 1 served until 3 took over: {d:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_notice_and_an_immediate_close_still_bring_a_successor_without_backoff() {
         let notice = r#"{"stream":"!serverShutdown","data":{"e":"serverShutdown","E":1,"T":2}}"#;
         let url = server(vec![
-            Script::SendThenClose(vec![Message::text(notice)], "unused"),
+            Script::SendThenClose(vec![Message::text(notice)], "going away"),
             Script::SendThenClose(vec![Message::text("after")], "bye"),
         ])
         .await;
         let mut cfg = fast(url);
-        cfg.backoff.initial = Duration::from_secs(30); // a backoff pause would make the test time out
+        cfg.backoff.initial = Duration::from_secs(30);
         cfg.backoff.max = Duration::from_secs(30);
         let d = describe(&collect(cfg, 5).await);
         assert_eq!(d[1], format!("text 1 {notice}"));
-        assert_eq!(d[2], "disconnected 1 server announced shutdown");
-        assert!(d[3].starts_with("connected 2"));
-        assert_eq!(d[4], "text 2 after");
+        assert!(d.contains(&"disconnected 1 closed by server: 1001 going away".to_owned()));
+        assert!(d.iter().any(|l| l.starts_with("connected 2")));
+        assert!(d.contains(&"text 2 after".to_owned()), "{d:?}");
     }
 
     #[tokio::test]

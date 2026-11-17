@@ -10,6 +10,7 @@
 //! short by a crash ends with `Truncated`, a damaged one with `Corrupt`.
 
 pub mod text;
+pub mod zst;
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -47,6 +48,9 @@ pub enum FrameKind {
     /// Frames were dropped because a queue was full. `aux` is how many, the payload names
     /// the queue. Data before and after this point do not connect.
     Overflow = 6,
+    /// The answer to a ping this recorder sent. `aux` is the connection number, the payload
+    /// the ping's send time (8 bytes, little-endian ns): the round trip is `recv_ts` minus it.
+    Rtt = 7,
 }
 
 impl FrameKind {
@@ -59,6 +63,7 @@ impl FrameKind {
             FrameKind::Connected => "connected",
             FrameKind::Disconnected => "disconnected",
             FrameKind::Overflow => "overflow",
+            FrameKind::Rtt => "rtt",
         }
     }
 
@@ -70,6 +75,7 @@ impl FrameKind {
             4 => FrameKind::Connected,
             5 => FrameKind::Disconnected,
             6 => FrameKind::Overflow,
+            7 => FrameKind::Rtt,
             _ => return None,
         })
     }
@@ -632,6 +638,7 @@ mod tests {
             Just(FrameKind::Connected),
             Just(FrameKind::Disconnected),
             Just(FrameKind::Overflow),
+            Just(FrameKind::Rtt),
         ]
     }
 

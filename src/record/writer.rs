@@ -32,10 +32,12 @@ impl Rotator {
         }
     }
 
-    pub fn write(&mut self, frame: &OwnedFrame) -> io::Result<()> {
+    /// Write a frame. Returns the file this write closed, if it started a new hour.
+    pub fn write(&mut self, frame: &OwnedFrame) -> io::Result<Option<PathBuf>> {
         let hour = hour_start(frame.recv_ts);
+        let mut closed = None;
         if self.current.as_ref().is_none_or(|(h, _, _)| *h != hour) {
-            self.close_current()?;
+            closed = self.close_current()?;
             let t = Utc::from_ns(frame.recv_ts);
             let dir = self.root.join(t.date()).join("frames");
             fs::create_dir_all(&dir)?;
@@ -46,7 +48,7 @@ impl Rotator {
         let (_, file, _) = self.current.as_mut().expect("opened above");
         file.write_frame(frame.as_frame())?;
         self.bytes += 25 + frame.payload.len() as u64;
-        Ok(())
+        Ok(closed)
     }
 
     /// Bytes of frame records written so far.
@@ -65,11 +67,13 @@ impl Rotator {
         Ok(self.finished)
     }
 
-    fn close_current(&mut self) -> io::Result<()> {
-        if let Some((_, file, _)) = self.current.take() {
-            self.finished.push(file.finish()?);
-        }
-        Ok(())
+    fn close_current(&mut self) -> io::Result<Option<PathBuf>> {
+        let Some((_, file, _)) = self.current.take() else {
+            return Ok(None);
+        };
+        let path = file.finish()?;
+        self.finished.push(path.clone());
+        Ok(Some(path))
     }
 }
 

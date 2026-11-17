@@ -1,13 +1,16 @@
 //! Local order book.
 //!
 //! `OrderBook` is the interface every book implements. `RefBook` is the reference: simple
-//! and obviously correct, used as the ground truth in tests. Faster books are added later
-//! and must produce the same state as `RefBook` for any sequence of updates.
+//! and obviously correct, used as the ground truth in tests and in replay. `LadderBook` is
+//! the fast one the recorder's hot path uses; a property test holds it to the reference
+//! for any sequence of updates, valid or not.
 
+mod ladder;
 mod reference;
 
 use std::fmt;
 
+pub use ladder::LadderBook;
 pub use reference::RefBook;
 
 use crate::event::{DepthDiff, Level};

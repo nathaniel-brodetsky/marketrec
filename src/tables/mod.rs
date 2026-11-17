@@ -31,7 +31,7 @@ use parquet::file::properties::WriterProperties;
 use crate::book::{OrderBook, Side};
 use crate::event::{BookTicker, DepthDiff, Level, Trade};
 use crate::frames::Header;
-use crate::pipeline::{QualityEvent, Sink};
+use crate::pipeline::{FrameState, QualityEvent, Sink};
 use crate::sync::DiffOutcome;
 use crate::time::{NS_PER_DAY, NS_PER_HOUR, Utc, hour_start};
 use builders::Builders;
@@ -105,12 +105,14 @@ impl From<arrow_schema::ArrowError> for TablesError {
 }
 
 /// Time accounting for the manifest: receive time up to `ts` has been credited, and the
-/// state since then is `covered` (a stream connection open) and `synced` (book valid).
+/// state since then is `covered` (a stream connection open), `synced` (book valid) and
+/// `late` (data more than a second behind the exchange).
 #[derive(Debug, Clone, Copy)]
 struct Clock {
     ts: i64,
     covered: bool,
     synced: bool,
+    late: bool,
 }
 
 impl Clock {
@@ -124,6 +126,9 @@ impl Clock {
         }
         if self.synced {
             m.synced_ns += to - self.ts;
+        }
+        if self.late {
+            m.late_ns += to - self.ts;
         }
         self.ts = to;
     }
@@ -391,7 +396,10 @@ fn close_parts(day: &mut Day, written: &mut Vec<PathBuf>) -> Result<(), TablesEr
 
 impl Sink for Tables {
     fn depth(&mut self, recv_ts: i64, diff: &DepthDiff, _outcome: DiffOutcome) {
-        self.with_day(recv_ts, |d| d.builders.depth(recv_ts, diff, SOURCE_JSON));
+        self.with_day(recv_ts, |d| {
+            d.builders.depth(recv_ts, diff, SOURCE_JSON);
+            d.manifest.lag.record(recv_ts - diff.event_ts);
+        });
     }
 
     fn book_ticker(&mut self, recv_ts: i64, t: &BookTicker) {
@@ -415,12 +423,24 @@ impl Sink for Tables {
         });
     }
 
-    fn after_frame(&mut self, recv_ts: i64, connected: bool, book: Option<&dyn OrderBook>) {
+    fn duplicate(&mut self, recv_ts: i64) {
+        self.with_day(recv_ts, |d| d.manifest.duplicates += 1);
+    }
+
+    fn rtt(&mut self, recv_ts: i64, conn: u64, rtt_ns: i64) {
+        self.with_day(recv_ts, |d| {
+            d.builders.rtt(recv_ts, conn, rtt_ns, SOURCE_JSON);
+            d.manifest.rtt.record(rtt_ns);
+        });
+    }
+
+    fn after_frame(&mut self, recv_ts: i64, state: FrameState, book: Option<&dyn OrderBook>) {
         let valid = book.map(|b| b.update_id());
         let now = Clock {
             ts: recv_ts,
-            covered: connected,
+            covered: state.connected,
             synced: valid.is_some(),
+            late: state.late,
         };
         if self.error.is_some() || recv_ts < self.skip_before {
             // follow the state only; time before `skip_before` is not credited

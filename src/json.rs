@@ -9,12 +9,13 @@
 //! {"stream":"!serverShutdown","data":{"e":"serverShutdown","E":..,"T":..}}
 //! ```
 //!
-//! Strings are borrowed from the frame. Price and quantity arrays of a depth message are
-//! still collected into temporary vectors here; making that path allocation-free is a later,
-//! separately tested step.
+//! Strings are borrowed from the frame, and the levels of a depth message are parsed straight
+//! into the decoder's reused vectors, so decoding a message does not allocate once those
+//! vectors have grown to the usual depth (checked by a test with a counting allocator).
 
 use std::fmt;
 
+use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
@@ -77,28 +78,235 @@ impl From<serde_json::Error> for DecodeError {
     }
 }
 
-#[derive(Deserialize)]
-struct Envelope<'a> {
-    #[serde(borrow)]
-    stream: &'a str,
-    #[serde(borrow)]
-    data: &'a RawValue,
+/// What a message holds, parsed in one pass over the frame. Depth levels go straight into
+/// the decoder's vectors; the rest borrows from the frame.
+enum Parsed<'de> {
+    Depth(u64, &'de str),
+    Ticker(BookTickerRaw<'de>),
+    Trade(TradeRaw<'de>),
+    Shutdown(ShutdownRaw),
+    Unknown,
 }
 
-#[derive(Deserialize)]
-struct DepthRaw<'a> {
-    #[serde(rename = "E")]
-    event_time: u64,
-    #[serde(rename = "s", borrow)]
-    symbol: &'a str,
-    #[serde(rename = "U")]
-    first_update_id: u64,
-    #[serde(rename = "u")]
-    final_update_id: u64,
-    #[serde(rename = "b", borrow)]
-    bids: Vec<[&'a str; 2]>,
-    #[serde(rename = "a", borrow)]
-    asks: Vec<[&'a str; 2]>,
+/// `btcusdt@depth@100ms` -> `depth@100ms`; `!serverShutdown` has no symbol part.
+fn stream_kind(stream: &str) -> &str {
+    stream.split_once('@').map_or(stream, |(_, rest)| rest)
+}
+
+/// The envelope `{"stream":..,"data":{..}}`. Binance sends `stream` first, so `data` is
+/// parsed knowing its kind, in the same pass; were it first, it is kept as raw JSON and
+/// parsed after.
+struct Message<'a> {
+    depth: &'a mut DepthDiff,
+    price: Grid,
+    qty: Grid,
+    error: &'a mut Option<DecodeError>,
+}
+
+impl Message<'_> {
+    fn data<'de, D: de::Deserializer<'de>>(
+        self,
+        kind: &str,
+        d: D,
+    ) -> Result<Parsed<'de>, D::Error> {
+        Ok(match kind {
+            "depth" | "depth@100ms" => {
+                let (e, s) = DepthData {
+                    out: self.depth,
+                    price: self.price,
+                    qty: self.qty,
+                    error: self.error,
+                }
+                .deserialize(d)?;
+                Parsed::Depth(e, s)
+            }
+            "bookTicker" => Parsed::Ticker(BookTickerRaw::deserialize(d)?),
+            "trade" => Parsed::Trade(TradeRaw::deserialize(d)?),
+            "!serverShutdown" => Parsed::Shutdown(ShutdownRaw::deserialize(d)?),
+            _ => {
+                IgnoredAny::deserialize(d)?;
+                Parsed::Unknown
+            }
+        })
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for Message<'_> {
+    type Value = Parsed<'de>;
+
+    fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        d.deserialize_map(self)
+    }
+}
+
+/// `data` for a known kind, as a seed for `next_value_seed`.
+struct Data<'a, 'k> {
+    msg: Message<'a>,
+    kind: &'k str,
+}
+
+impl<'de> DeserializeSeed<'de> for Data<'_, '_> {
+    type Value = Parsed<'de>;
+
+    fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        self.msg.data(self.kind, d)
+    }
+}
+
+impl<'de> Visitor<'de> for Message<'_> {
+    type Value = Parsed<'de>;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a combined stream message")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut msg = Some(self);
+        let (mut kind, mut parsed, mut raw): (Option<&'de str>, _, Option<&'de RawValue>) =
+            (None, None, None);
+        while let Some(key) = map.next_key::<&'de str>()? {
+            match (key, kind) {
+                ("stream", _) => kind = Some(stream_kind(map.next_value::<&'de str>()?)),
+                ("data", Some(k)) => {
+                    let m = msg
+                        .take()
+                        .ok_or_else(|| de::Error::duplicate_field("data"))?;
+                    parsed = Some(map.next_value_seed(Data { msg: m, kind: k })?);
+                }
+                ("data", None) => raw = Some(map.next_value()?),
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        let kind = kind.ok_or_else(|| de::Error::missing_field("stream"))?;
+        match (parsed, raw, msg) {
+            (Some(p), _, _) => Ok(p),
+            (None, Some(raw), Some(m)) => {
+                let mut d = serde_json::Deserializer::from_str(raw.get());
+                m.data(kind, &mut d).map_err(de::Error::custom)
+            }
+            _ => Err(de::Error::missing_field("data")),
+        }
+    }
+}
+
+/// The data object of a depth message, parsed into `out` without allocating. Yields the
+/// event time and the symbol; a bad price or quantity is left in `error`.
+struct DepthData<'a> {
+    out: &'a mut DepthDiff,
+    price: Grid,
+    qty: Grid,
+    error: &'a mut Option<DecodeError>,
+}
+
+impl<'de> DeserializeSeed<'de> for DepthData<'_> {
+    type Value = (u64, &'de str);
+
+    fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        d.deserialize_map(self)
+    }
+}
+
+impl<'de> Visitor<'de> for DepthData<'_> {
+    type Value = (u64, &'de str);
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a depth update object")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let DepthData {
+            out,
+            price,
+            qty,
+            error,
+        } = self;
+        let (mut event_time, mut symbol, mut first, mut last) = (None, None, None, None);
+        let (mut bids, mut asks) = (false, false);
+        while let Some(key) = map.next_key::<&'de str>()? {
+            match key {
+                "E" => event_time = Some(map.next_value::<u64>()?),
+                "s" => symbol = Some(map.next_value::<&'de str>()?),
+                "U" => first = Some(map.next_value::<u64>()?),
+                "u" => last = Some(map.next_value::<u64>()?),
+                "b" | "a" => {
+                    let levels = if key == "b" {
+                        bids = true;
+                        &mut out.bids
+                    } else {
+                        asks = true;
+                        &mut out.asks
+                    };
+                    map.next_value_seed(Levels {
+                        out: levels,
+                        price,
+                        qty,
+                        error: &mut *error,
+                    })?;
+                }
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        if !bids {
+            return Err(de::Error::missing_field("b"));
+        }
+        if !asks {
+            return Err(de::Error::missing_field("a"));
+        }
+        out.first_update_id = first.ok_or_else(|| de::Error::missing_field("U"))?;
+        out.final_update_id = last.ok_or_else(|| de::Error::missing_field("u"))?;
+        Ok((
+            event_time.ok_or_else(|| de::Error::missing_field("E"))?,
+            symbol.ok_or_else(|| de::Error::missing_field("s"))?,
+        ))
+    }
+}
+
+/// A `[["price","qty"],..]` array parsed into `out`, which keeps its capacity.
+struct Levels<'a> {
+    out: &'a mut Vec<Level>,
+    price: Grid,
+    qty: Grid,
+    error: &'a mut Option<DecodeError>,
+}
+
+impl<'de> DeserializeSeed<'de> for Levels<'_> {
+    type Value = ();
+
+    fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+        d.deserialize_seq(self)
+    }
+}
+
+impl<'de> Visitor<'de> for Levels<'_> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("an array of [price, quantity] pairs")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        self.out.clear();
+        while let Some([p, q]) = seq.next_element::<[&'de str; 2]>()? {
+            let level = steps(self.price, p, "price level").and_then(|price| {
+                Ok(Level {
+                    price,
+                    qty: steps(self.qty, q, "level quantity")?,
+                })
+            });
+            match level {
+                Ok(l) => self.out.push(l),
+                Err(e) => {
+                    *self.error = Some(e);
+                    return Err(de::Error::custom("invalid number"));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Deserialize)]
@@ -177,34 +385,30 @@ impl JsonDecoder {
 
     /// Decode one frame of the combined stream.
     pub fn decode(&mut self, frame: &[u8]) -> Result<Event<'_>, DecodeError> {
-        let env: Envelope<'_> = serde_json::from_slice(frame)?;
-        let data = env.data.get();
-        // "btcusdt@depth@100ms" -> "depth@100ms"; "!serverShutdown" has no symbol part
-        let kind = env
-            .stream
-            .split_once('@')
-            .map_or(env.stream, |(_, rest)| rest);
-        match kind {
-            "!serverShutdown" => {
-                let raw: ShutdownRaw = serde_json::from_str(data)?;
-                Ok(Event::ServerShutdown(ServerShutdown {
-                    event_ts: self.ns(raw.event_time)?,
-                    shutdown_ts: self.ns(raw.shutdown_time)?,
-                }))
-            }
-            "depth" | "depth@100ms" => {
-                let raw: DepthRaw<'_> = serde_json::from_str(data)?;
-                self.check_symbol(raw.symbol)?;
-                let event_ts = self.ns(raw.event_time)?;
-                fill_levels(&mut self.depth.bids, &raw.bids, self.price, self.qty)?;
-                fill_levels(&mut self.depth.asks, &raw.asks, self.price, self.qty)?;
-                self.depth.event_ts = event_ts;
-                self.depth.first_update_id = raw.first_update_id;
-                self.depth.final_update_id = raw.final_update_id;
+        let mut error = None;
+        let mut de = serde_json::Deserializer::from_slice(frame);
+        let msg = Message {
+            depth: &mut self.depth,
+            price: self.price,
+            qty: self.qty,
+            error: &mut error,
+        };
+        let parsed = match msg.deserialize(&mut de) {
+            Ok(p) => p,
+            Err(e) => return Err(error.unwrap_or(DecodeError::Json(e))),
+        };
+        de.end()?;
+        match parsed {
+            Parsed::Shutdown(raw) => Ok(Event::ServerShutdown(ServerShutdown {
+                event_ts: self.ns(raw.event_time)?,
+                shutdown_ts: self.ns(raw.shutdown_time)?,
+            })),
+            Parsed::Depth(event_time, symbol) => {
+                self.check_symbol(symbol)?;
+                self.depth.event_ts = self.ns(event_time)?;
                 Ok(Event::Depth(&self.depth))
             }
-            "bookTicker" => {
-                let raw: BookTickerRaw<'_> = serde_json::from_str(data)?;
+            Parsed::Ticker(raw) => {
                 self.check_symbol(raw.symbol)?;
                 Ok(Event::BookTicker(BookTicker {
                     update_id: raw.update_id,
@@ -214,8 +418,7 @@ impl JsonDecoder {
                     ask_qty: steps(self.qty, raw.ask_qty, "A")?,
                 }))
             }
-            "trade" => {
-                let raw: TradeRaw<'_> = serde_json::from_str(data)?;
+            Parsed::Trade(raw) => {
                 self.check_symbol(raw.symbol)?;
                 Ok(Event::Trade(Trade {
                     event_ts: self.ns(raw.event_time)?,
@@ -226,7 +429,7 @@ impl JsonDecoder {
                     is_buyer_maker: raw.is_buyer_maker,
                 }))
             }
-            _ => Err(DecodeError::UnknownStream),
+            Parsed::Unknown => Err(DecodeError::UnknownStream),
         }
     }
 

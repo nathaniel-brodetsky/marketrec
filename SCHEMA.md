@@ -17,6 +17,7 @@ data/
         trades/part-000.parquet
         book_l20/part-000.parquet
         quality/part-000.parquet
+        link_rtt/part-000.parquet
         manifest.json
 ```
 
@@ -51,7 +52,10 @@ data/
 One row per changed price level of a depth update (`<symbol>@depth@100ms`). All rows of
 one update share `recv_ts`, `first_update_id` and `final_update_id`. Every update received
 is here, including those received while the book was being rebuilt; an update without
-levels is one row with `side` 0, because it still moves the update IDs on.
+levels is one row with `side` 0, because it still moves the update IDs on. While a new
+connection takes over from an old one, both deliver the same stream for a while; every
+table keeps the copy that arrived first, and the manifest counts the others in
+`duplicates`.
 
 | column | type | meaning |
 |--------|------|---------|
@@ -122,9 +126,22 @@ Every data-quality event, in order.
 
 Kinds: `connected`, `disconnected`, `gap`, `snapshot_too_old`, `invalid_book`,
 `buffer_overflow`, `reconnect`, `overflow`, `synced`, `resync`, `bbo_mismatch`,
-`undecodable`, `snapshot_failed`, `server_shutdown`.
+`undecodable`, `snapshot_failed`, `server_shutdown`, `late`, `on_time`.
 
 The kinds and their details are listed under [Quality kinds](#quality-kinds).
+
+### link_rtt
+
+Round trips of the recorder's own WebSocket pings, one every 5 s per connection. Both ends of
+a round trip are this machine's clock, so no clock agreement is needed: compared with the
+lag of the data, it tells whether late data was delayed on the link or before it.
+
+| column | type | meaning |
+|--------|------|---------|
+| `recv_ts` | int64 | receive time of the pong, ns |
+| `conn` | int64 | connection number within the run |
+| `rtt_ns` | int64 | round trip, ns |
+| `source` | string | feed |
 
 ## Quality kinds
 
@@ -148,6 +165,12 @@ pairs; the update ID in `synced` and `resync` is part of the contract (`verify` 
 | undecodable | unchanged | a frame could not be decoded | `kind=K reason="..."` |
 | snapshot_failed | unchanged | a snapshot could not be fetched; requested again while diffs wait | `id=REQUEST reason="..."` |
 | server_shutdown | unchanged | the exchange announced that it will close the connection | `shutdown_ts=NS` |
+| late | unchanged, but behind the market | a depth update arrived more than 1 s after its exchange time | `lag_ms=N` |
+| on_time | unchanged | a depth update arrived within 0.5 s again; ends a `late` interval | `lag_ms=N late_for_ms=N max_lag_ms=N` |
+
+A `late` interval ends at the next `on_time`, or when its connection ends. In it the book can
+be valid, so continuity holds, but it shows the market as it was seconds before. Lags are
+receive time minus exchange time, so they include this machine's clock offset.
 
 ## manifest.json
 
@@ -165,6 +188,11 @@ One per day directory.
 | `covered_ns` | receive time with a stream connection open |
 | `synced_ns` | the part of it with a valid book |
 | `synced_share` | `synced_ns / covered_ns` |
+| `late_ns` | time in `late` intervals |
+| `lag` | lag of every depth update behind its exchange time: `counts` per bucket in ms (exact below 1000 ms, then three significant digits, so days and runs add up exactly), `below_zero` (updates that arrived before their exchange time) and `max_ns` |
+| `lag_p50_ms`, `lag_p99_ms` | median and 99th percentile of `lag`, lower bounds of their buckets |
+| `rtt`, `rtt_p50_ms`, `rtt_p99_ms` | the same for the round trips in `link_rtt` |
+| `duplicates` | messages dropped because another connection had delivered them first |
 
 ## Reading
 

@@ -182,6 +182,8 @@ pub struct Session {
     pub trades: Vec<SentTrade>,
     pub ex: Exchange,
     pub snapshot_delay: i64,
+    /// How late the messages arrive after their exchange time.
+    pub lag: i64,
     recorder: Pipeline<RefBook>,
     requests: Requests,
     pending: VecDeque<(i64, u64)>,
@@ -197,6 +199,7 @@ impl Session {
             trades: Vec::new(),
             ex: Exchange::new(seed),
             snapshot_delay: 50 * MS,
+            lag: 0,
             recorder: Pipeline::new(&header(), RefBook::new(), SyncConfig::default())
                 .expect("valid header"),
             requests: Requests::default(),
@@ -206,7 +209,12 @@ impl Session {
         }
     }
 
-    pub fn push(&mut self, frame: OwnedFrame) {
+    /// Record a frame. A message frame without a connection number belongs to the current
+    /// connection.
+    pub fn push(&mut self, mut frame: OwnedFrame) {
+        if frame.kind == FrameKind::Text && frame.aux == 0 {
+            frame.aux = self.conn;
+        }
         self.recorder.on_frame(frame.as_frame(), &mut self.requests);
         for id in self.requests.0.drain(..) {
             self.pending
@@ -263,7 +271,7 @@ impl Session {
                 ts,
                 format!(
                     r#"{{"stream":"btcusdt@depth@100ms","data":{{"e":"depthUpdate","E":{},"s":"BTCUSDT","U":{first},"u":{last},"b":[{}],"a":[{}]}}}}"#,
-                    ts / 1000,
+                    (ts - self.lag) / 1000,
                     levels(&bids),
                     levels(&asks)
                 ),
@@ -287,7 +295,7 @@ impl Session {
                 let id = self.ex.next_trade();
                 let m = id.is_multiple_of(2);
                 let (price, q) = (MID + (id % 7) as i64, 1 + id as i64);
-                let (e, t) = (ts / 1000, ts / 1000 - 1);
+                let (e, t) = ((ts - self.lag) / 1000, (ts - self.lag) / 1000 - 1);
                 self.trades
                     .push((ts, e * 1000, t * 1000, id as i64, price, q, m));
                 self.push(text(
@@ -304,6 +312,16 @@ impl Session {
             self.messages += 1;
             ts += every;
         }
+    }
+
+    /// A round-trip probe sent at `ts - rtt` comes back at `ts`.
+    pub fn probe(&mut self, ts: i64, rtt: i64) {
+        self.push(OwnedFrame {
+            kind: FrameKind::Rtt,
+            recv_ts: ts,
+            aux: self.conn,
+            payload: (ts - rtt).to_le_bytes().to_vec(),
+        });
     }
 
     /// The exchange moves on by `n` messages that never arrive.

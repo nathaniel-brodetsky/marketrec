@@ -19,6 +19,7 @@ COLUMNS = {
     "trades": ["recv_ts", "event_ts", "trade_ts", "trade_id", "price", "qty", "is_buyer_maker", "source"],
     "book_l20": ["recv_ts", "last_update_id", "bid_px", "bid_qty", "ask_px", "ask_qty", "source"],
     "quality": ["ts", "kind", "detail", "source"],
+    "link_rtt": ["recv_ts", "conn", "rtt_ns", "source"],
 }
 
 

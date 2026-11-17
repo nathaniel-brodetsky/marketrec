@@ -37,8 +37,19 @@ version). Readers reject other format versions.
 | 2    | `binary`       | connection number   | WebSocket binary message |
 | 3    | `snapshot`     | snapshot request ID: the `recv_ts` of the frame that caused the request | REST depth response body, or `{"error":...}` if the fetch failed |
 | 4    | `connected`    | connection number   | URL                      |
-| 5    | `disconnected` | connection number   | reason; `stopped` if the recorder stopped on purpose |
+| 5    | `disconnected` | connection number   | reason; `stopped` if the recorder stopped on purpose, `handover` if a successor connection took over |
 | 6    | `overflow`     | frames dropped      | name of the full queue   |
+| 7    | `rtt`          | connection number   | send time of the recorder's own ping, i64 little-endian ns; the round trip is `recv_ts` minus it |
+
+## Compression
+
+A finished file may be stored compressed as `<name>.frames.zst`: one zstd frame, with its
+content checksum, holding exactly the bytes of `<name>.frames`. The recorder compresses
+every hourly file once it is finished (`record --no-compress` keeps them raw), and
+`marketrec frames compress` does the same for older files. The compressed copy is written
+as `.tmp`, read back and compared byte for byte with the original, and only then renamed
+and the original removed. Every command that reads frames opens both forms; a damaged
+compressed file fails its checksum and is reported, never read as other data.
 
 ## Integrity
 

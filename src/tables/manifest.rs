@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use super::schema::{SCHEMA_VERSION, Table};
 use crate::frames::Header;
+use crate::timing::MsHistogram;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Run {
@@ -42,6 +43,27 @@ pub struct DayManifest {
     pub covered_ns: i64,
     pub synced_ns: i64,
     pub synced_share: f64,
+    /// Time in `late` intervals: data more than a second behind the exchange.
+    #[serde(default)]
+    pub late_ns: i64,
+    /// Lag of depth updates behind their exchange time (`crate::timing`), and its p50 and p99
+    /// in ms for reading at a glance.
+    #[serde(default)]
+    pub lag: MsHistogram,
+    #[serde(default)]
+    pub lag_p50_ms: Option<u64>,
+    #[serde(default)]
+    pub lag_p99_ms: Option<u64>,
+    /// Round trips of the recorder's own pings (`crate::timing`), with p50 and p99 in ms.
+    #[serde(default)]
+    pub rtt: MsHistogram,
+    #[serde(default)]
+    pub rtt_p50_ms: Option<u64>,
+    #[serde(default)]
+    pub rtt_p99_ms: Option<u64>,
+    /// Messages dropped because another connection had delivered them first.
+    #[serde(default)]
+    pub duplicates: u64,
 }
 
 fn host() -> String {
@@ -77,6 +99,14 @@ impl DayManifest {
             covered_ns: 0,
             synced_ns: 0,
             synced_share: 0.0,
+            late_ns: 0,
+            lag: MsHistogram::default(),
+            lag_p50_ms: None,
+            lag_p99_ms: None,
+            rtt: MsHistogram::default(),
+            rtt_p50_ms: None,
+            rtt_p99_ms: None,
+            duplicates: 0,
         }
     }
 
@@ -101,12 +131,17 @@ impl DayManifest {
         *self.quality.entry(kind.to_owned()).or_default() += 1;
     }
 
+    /// The figures derived from the counts.
     fn share(&mut self) {
         self.synced_share = if self.covered_ns > 0 {
             self.synced_ns as f64 / self.covered_ns as f64
         } else {
             0.0
         };
+        self.lag_p50_ms = self.lag.quantile_ms(0.5);
+        self.lag_p99_ms = self.lag.quantile_ms(0.99);
+        self.rtt_p50_ms = self.rtt.quantile_ms(0.5);
+        self.rtt_p99_ms = self.rtt.quantile_ms(0.99);
     }
 
     fn key(&self) -> (u32, &str, &str, &str, &str) {
@@ -162,6 +197,10 @@ impl DayManifest {
             }
             old.covered_ns += self.covered_ns;
             old.synced_ns += self.synced_ns;
+            old.late_ns += self.late_ns;
+            old.lag.merge(&self.lag);
+            old.rtt.merge(&self.rtt);
+            old.duplicates += self.duplicates;
             old
         } else {
             self.clone()
