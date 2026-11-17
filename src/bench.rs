@@ -114,6 +114,8 @@ pub struct BookTime {
 #[derive(Debug, Clone)]
 pub struct BenchReport {
     pub header: Header,
+    /// The day directory's name.
+    pub date: String,
     pub frames: usize,
     pub files: usize,
     pub span_ns: i64,
@@ -408,6 +410,10 @@ pub fn bench_day(day: &Path, opts: &BenchOptions) -> Result<BenchReport, BenchEr
         }
     }
     Ok(BenchReport {
+        date: day
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
         header,
         frames: frames.len(),
         files,
@@ -451,15 +457,20 @@ impl fmt::Display for Spread {
 
 impl fmt::Display for BenchReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let span = self.span_ns as f64 / 1e9;
         writeln!(
             f,
-            "input         {} {}: {} frames from {} file{}, {:.1} s of data",
+            "input         {} {}: {} frames from {} file{} spanning {}",
             self.header.symbol,
-            self.header.price_step,
+            self.date,
             self.frames,
             self.files,
             if self.files == 1 { "" } else { "s" },
-            self.span_ns as f64 / 1e9
+            if span >= 3600.0 {
+                format!("{:.1} h", span / 3600.0)
+            } else {
+                format!("{span:.0} s")
+            }
         )?;
         let decode: Vec<String> = self
             .decode
@@ -548,10 +559,12 @@ mod tests {
         s
     }
 
-    /// The hot path must not allocate: once the book and the buffers have grown, a frame
-    /// costs no allocation, whatever the messages, their lags or the round trips.
+    /// Decoding and the pipeline allocate nothing per frame once their buffers have grown,
+    /// whatever the messages, their lags or the round trips: with the ladder book a frame
+    /// costs no allocation at all. (The reference book allocates a tree node for each new
+    /// price level.)
     #[test]
-    fn the_hot_path_does_not_allocate() {
+    fn with_the_ladder_book_a_frame_allocates_nothing() {
         let mut s = Session::new(42);
         s.connect(DAY0);
         // warm-up: the book, the buffers and both histograms get their memory

@@ -1,10 +1,15 @@
 //! Order book on sorted vectors, the best level at the end of each.
 //!
-//! Most updates touch the levels near the best price. With the best level last, finding a
-//! level is a binary search over a contiguous array, and inserting or removing one moves
-//! only the few levels better than it. The memory is reserved once, so updates do not
-//! allocate after the book has reached its usual depth. It must hold exactly what
-//! `RefBook` holds for any sequence of updates; the tests below check that.
+//! With the best level last, finding a level is a short search from the end of a contiguous
+//! array, and inserting or removing one moves only the levels better than it. The memory is
+//! reserved once, so updates do not allocate after the book has reached its usual depth.
+//! It must hold exactly what `RefBook` holds for any sequence of updates; the tests below
+//! check that.
+//!
+//! Measured on a recorded BTCUSDT day, real updates also reach deep into the 5000-level
+//! book, where an insert or a removal moves thousands of levels: the median update took
+//! 0.84 µs here against 0.47 µs in `RefBook`. Synthetic updates near the top had shown the
+//! opposite. The recorder therefore uses `RefBook`; this book stays for `bench`.
 
 use super::{BookError, OrderBook, Side, validate};
 use crate::event::Level;

@@ -10,6 +10,7 @@ pub mod frames;
 pub mod json;
 pub mod net;
 pub mod pipeline;
+pub mod rebuild;
 pub mod record;
 pub mod replay;
 pub mod sync;

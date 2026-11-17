@@ -741,8 +741,62 @@ fn check_freshness(day: &Path, m: &DayManifest, report: &mut VerifyReport) {
     report.push("freshness", outcome, detail);
 }
 
+/// The frames that derive one day exactly: the day before's, for the state at midnight;
+/// the day's own; and the day after's, whose first frame closes the day's time.
+pub(crate) struct DayInputs {
+    pub files: Vec<PathBuf>,
+    pub n_prev: usize,
+    pub n_this: usize,
+    start: i64,
+}
+
+impl DayInputs {
+    /// `None` if the day has no frames.
+    pub fn find(day: &Path, start: i64) -> Option<Self> {
+        let frames_of = |dir: &Path| -> Vec<PathBuf> {
+            if dir.is_dir() {
+                input_files(dir).unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        };
+        let sibling = |offset: i64| {
+            day.parent()
+                .map(|p| frames_of(&p.join(Utc::from_ns(start + offset).date()).join("frames")))
+                .unwrap_or_default()
+        };
+        let this = frames_of(&day.join("frames"));
+        if this.is_empty() {
+            return None;
+        }
+        let (prev, next) = (sibling(-NS_PER_DAY), sibling(NS_PER_DAY));
+        Some(Self {
+            n_prev: prev.len(),
+            n_this: this.len(),
+            files: prev.into_iter().chain(this).chain(next).collect(),
+            start,
+        })
+    }
+
+    /// Derive the day's tables under `out` (as `out/binance/<symbol>/<date>`), writing
+    /// nothing for other days.
+    pub fn convert(
+        &self,
+        out: &Path,
+        recorder: &str,
+    ) -> Result<crate::tables::convert::ConvertSummary, crate::tables::convert::ConvertError> {
+        convert_files(
+            self.files.clone(),
+            out,
+            recorder,
+            self.start,
+            self.start + NS_PER_DAY,
+        )
+    }
+}
+
 /// A directory removed when dropped.
-struct Scratch(PathBuf);
+pub(crate) struct Scratch(pub PathBuf);
 
 impl Drop for Scratch {
     fn drop(&mut self) {
@@ -760,39 +814,16 @@ fn check_rebuild(
     let Some(start) = day_start(&m.date) else {
         return;
     };
-    let frames_of = |dir: &Path| -> Vec<PathBuf> {
-        if dir.is_dir() {
-            input_files(dir).unwrap_or_default()
-        } else {
-            Vec::new()
-        }
-    };
-    let this = frames_of(&day.join("frames"));
-    if this.is_empty() {
+    let Some(inputs) = DayInputs::find(day, start) else {
         report.push(
             "rebuild",
             Outcome::Warn,
             "no frames files in frames/: the tables cannot be checked against their source",
         );
         return;
-    }
-    let prev_dir = day.parent().map(|p| {
-        p.join(Utc::from_ns(start - NS_PER_DAY).date())
-            .join("frames")
-    });
-    let prev = prev_dir.as_deref().map(frames_of).unwrap_or_default();
-    // the first frame of the day after closes this day's time accounting
-    let next = day
-        .parent()
-        .map(|p| {
-            frames_of(
-                &p.join(Utc::from_ns(start + NS_PER_DAY).date())
-                    .join("frames"),
-            )
-        })
-        .unwrap_or_default();
+    };
     // without the day before, the book at midnight is unknown to the rebuild
-    let state_unknown = prev.is_empty() && m.runs.iter().any(|r| r.book_at_start.is_some());
+    let state_unknown = inputs.n_prev == 0 && m.runs.iter().any(|r| r.book_at_start.is_some());
 
     let base = opts.scratch.clone().unwrap_or_else(std::env::temp_dir);
     let scratch = Scratch(base.join(format!(
@@ -800,21 +831,14 @@ fn check_rebuild(
         std::process::id(),
         crate::net::ws::now_ns()
     )));
-    let (n_prev, n_this) = (prev.len(), this.len());
-    let files: Vec<PathBuf> = prev.into_iter().chain(this).chain(next).collect();
+    let (n_prev, n_this) = (inputs.n_prev, inputs.n_this);
     let mut crash = found.crash_traces.clone();
-    for f in &files {
+    for f in &inputs.files {
         if f.to_string_lossy().ends_with(".tmp") {
             crash.push(format!("{} was never finished", f.display()));
         }
     }
-    let summary = match convert_files(
-        files,
-        &scratch.0,
-        "marketrec verify",
-        start,
-        start + NS_PER_DAY,
-    ) {
+    let summary = match inputs.convert(&scratch.0, "marketrec verify") {
         Ok(s) => s,
         Err(e) => {
             report.push(
@@ -875,6 +899,12 @@ fn check_rebuild(
         }
     }
 
+    let older: Vec<String> = m
+        .runs
+        .iter()
+        .filter(|r| r.derivation < crate::tables::DERIVATION)
+        .map(|r| format!("{}, derivation {}", r.recorder, r.derivation))
+        .collect();
     let files_of = |n: usize| format!("{n} frames file{}", if n == 1 { "" } else { "s" });
     let mut source = format!("the day's {}", files_of(n_this));
     if n_prev > 0 {
@@ -894,10 +924,22 @@ fn check_rebuild(
                 format!("every table rebuilt from {source} is identical, row for row"),
             );
         }
-    } else if !crash.is_empty() {
+    } else if !crash.is_empty() || !older.is_empty() {
+        let why = match (crash.is_empty(), older.is_empty()) {
+            (false, true) => "as expected after a crash".to_owned(),
+            (true, false) => format!(
+                "and the day holds tables derived by older rules ({}), so the difference can come from the code",
+                older.join("; ")
+            ),
+            _ => format!(
+                "as expected after a crash and with tables derived by older rules ({})",
+                older.join("; ")
+            ),
+        };
         let mut detail = format!(
-            "tables rebuilt from {source} differ, as expected after a crash: {}\nrebuild the day with `marketrec convert` from the frames",
-            differ.join("; ")
+            "tables rebuilt from {source} differ, {why}: {}\n`marketrec rebuild --day {}` derives the day again from its frames",
+            differ.join("; "),
+            day.display()
         );
         for c in crash {
             detail.push('\n');
@@ -1261,7 +1303,11 @@ mod tests {
         );
         let rb = r.check("rebuild").unwrap();
         assert_eq!(rb.outcome, Outcome::Warn, "{r}");
-        assert!(rb.detail.contains("marketrec convert"), "{}", rb.detail);
+        assert!(
+            rb.detail.contains("marketrec rebuild --day"),
+            "{}",
+            rb.detail
+        );
         assert!(
             rb.detail.contains(".frames.tmp was never finished"),
             "{}",
@@ -1269,12 +1315,8 @@ mod tests {
         );
         assert_eq!(r.check("continuity").unwrap().outcome, Outcome::Pass, "{r}");
 
-        // the way out: convert the frames, the crashed run's included, into a new place
-        let fixed = dir.path().join("fixed");
-        crate::tables::convert::convert(&day.join("frames"), &fixed, "test").unwrap();
-        let fixed_day = fixed.join("binance/BTCUSDT/2026-11-21");
-        fs::rename(day.join("frames"), fixed_day.join("frames")).unwrap();
-        let r = verify_day(&fixed_day, &VerifyOptions::default());
+        // the way out: derive the day again from its frames, the crashed run's included
+        let r = crate::rebuild::rebuild_day(&day, true).unwrap().verify;
         assert_eq!(r.outcome(), Outcome::Pass, "{r}");
     }
 

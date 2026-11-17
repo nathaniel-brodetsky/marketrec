@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, watch};
 
-use crate::book::{LadderBook, RefBook};
+use crate::book::RefBook;
 use crate::frames::{FrameKind, Header, OwnedFrame};
 use crate::json::TimeUnit;
 use crate::net::rest::{Rest, RestError};
@@ -246,9 +246,10 @@ pub fn record(
     header
         .grids()
         .map_err(|e| RecordError::BadRules(e.to_string()))?;
-    // the hot path uses the fast book; the writer derives the tables with the reference
-    // book, so every live run also checks one against the other (see the tests)
-    let pipeline = Pipeline::new(&header, LadderBook::new(), SyncConfig::default())
+    // the reference book: on a recorded BTCUSDT day it applied an update faster at the
+    // median than the ladder (0.47 against 0.84 µs, see `bench`), because real updates reach
+    // deep into the 5000-level book, where the ladder's vector moves many levels
+    let pipeline = Pipeline::new(&header, RefBook::new(), SyncConfig::default())
         .map_err(|e| RecordError::BadRules(e.to_string()))?;
 
     let started = Instant::now();

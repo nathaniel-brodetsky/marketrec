@@ -22,6 +22,9 @@ pub struct Run {
     /// then: a run that continues over midnight. `None` for a run that starts on this day.
     #[serde(default)]
     pub book_at_start: Option<u64>,
+    /// `tables::DERIVATION` of the code that wrote this run's tables; 0 if not recorded.
+    #[serde(default)]
+    pub derivation: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -89,6 +92,7 @@ impl DayManifest {
                 first_recv_ts: None,
                 last_recv_ts: None,
                 book_at_start: None,
+                derivation: super::DERIVATION,
             }],
             rows: Table::ALL
                 .iter()

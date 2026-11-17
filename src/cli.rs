@@ -56,6 +56,16 @@ pub enum Command {
         #[arg(long)]
         scratch: Option<PathBuf>,
     },
+    /// Derive a recorded day's tables again from its frames, in place, then verify it: for
+    /// a day a crash left incomplete or that older rules derived. Frames are not touched.
+    Rebuild {
+        /// Directory of one recorded day.
+        #[arg(long)]
+        day: PathBuf,
+        /// Allow today's date (UTC); only when no recorder writes to it.
+        #[arg(long)]
+        today: bool,
+    },
     /// Measure the decode path on a recorded day: the JSON decoder, the whole pipeline with
     /// each book, and the book updates alone. Use a release build.
     Bench {
@@ -186,6 +196,7 @@ pub enum CliError {
     Decode(crate::json::DecodeError),
     Convert(crate::tables::convert::ConvertError),
     Bench(crate::bench::BenchError),
+    Rebuild(crate::rebuild::RebuildError),
     /// The input contains a damaged record; everything before it was processed.
     Damaged,
     /// `verify` found a failing check; the report says which.
@@ -206,6 +217,7 @@ impl fmt::Display for CliError {
             CliError::Decode(e) => write!(f, "{e}"),
             CliError::Convert(e) => write!(f, "{e}"),
             CliError::Bench(e) => write!(f, "{e}"),
+            CliError::Rebuild(e) => write!(f, "{e}"),
             CliError::Damaged => write!(f, "the input contains a damaged record"),
             CliError::VerifyFailed => write!(f, "verification failed"),
             CliError::LowDisk(m) => write!(f, "{m}"),
@@ -251,6 +263,14 @@ pub fn run(command: Command) -> Result<(), CliError> {
                 crate::verify::verify_day(&day, &crate::verify::VerifyOptions { quick, scratch });
             println!("{report}");
             if report.outcome() == crate::verify::Outcome::Fail {
+                return Err(CliError::VerifyFailed);
+            }
+            Ok(())
+        }
+        Command::Rebuild { day, today } => {
+            let r = crate::rebuild::rebuild_day(&day, today).map_err(CliError::Rebuild)?;
+            println!("{r}");
+            if r.verify.outcome() == crate::verify::Outcome::Fail {
                 return Err(CliError::VerifyFailed);
             }
             Ok(())

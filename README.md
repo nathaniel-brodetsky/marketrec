@@ -105,6 +105,7 @@ result      PASS
 | `convert` | build the Parquet tables from frames files, exactly as `record` does live | implemented |
 | `verify` | check a recorded day: manifest against files, continuity of the update stream re-checked from the tables alone, freshness, and a rebuild of every table from the frames compared row for row; exit 1 on failure | implemented |
 | `bench` | measure the decode path on a recorded day: the decoder per kind of message, the whole pipeline with each book (throughput, time per frame, allocations per frame), the book updates alone | implemented |
+| `rebuild` | derive a recorded day's tables again from its frames, in place, and verify it: after a crash, or when the rules of derivation have changed | implemented |
 
 ## What is implemented
 
@@ -113,7 +114,7 @@ result      PASS
 | Decimal strings to integer steps, no floating point, no allocation | `src/decimal.rs` | unit tests and property tests |
 | Decoder for the JSON combined stream: depth diffs, best bid and ask, trades, server shutdown notices; one pass over each frame, strings borrowed, depth levels parsed straight into reused vectors, so decoding does not allocate | `src/json.rs` | unit tests on sample frames, property tests on random and truncated input |
 | Reference order book (`BTreeMap`), invariants: positive prices, non-negative quantities, book not crossed | `src/book/` | unit tests, property test against a hash-map model |
-| Fast order book on sorted vectors, the best level last: binary search, short moves near the top, memory reserved once; snapshots built in one sort. The recorder's hot path uses it, the writer derives the tables with the reference book, so every live run compares the two | `src/book/ladder.rs` | property test: any sequence of sets, diffs, snapshots and clears, valid or not, leaves it holding exactly what the reference book holds and failing where it fails; the whole pipeline gives identical output with either book on a long session with a gap and a reconnect; mutation-tested |
+| A second order book on sorted vectors, the best level last: a galloping search from the best end, memory reserved once, no allocation per update, snapshots built in one sort. Measured on a recorded BTCUSDT day it is slower at the median than the reference book (0.84 against 0.47 µs per update), because real updates reach deep into the 5000-level book where the vector moves many levels; the recorder uses the reference book, and `bench` keeps measuring both | `src/book/ladder.rs` | property test: any sequence of sets, diffs, snapshots and clears, valid or not, leaves it holding exactly what the reference book holds and failing where it fails; the whole pipeline gives identical output with either book; deterministic tests of the search over a 5000-level book; mutation-tested |
 | Book synchronization (snapshot plus diffs) as Binance documents it: stale snapshots, gaps, duplicates, out-of-order diffs, reconnects | `src/sync.rs` | unit test per case; property test with dropped, duplicated and reordered diffs: a synced book always equals the exchange book |
 | Compression of finished hourly frames files with zstd on a thread of its own: the copy is read back and compared before the original is removed; every reader opens both forms | `src/frames/zst.rs` | round trip, a target that exists is never overwritten, a flipped byte fails the checksum, nothing is left behind on failure; the live recording test checks its files are compressed and replays them |
 | Frames file: raw hot-path input (messages, snapshots, connection events) with receive times; CRC-32 per record, atomic write, specified in `docs/FRAMES.md` | `src/frames/` | round trips, every truncation point, random bit flips are always detected |
@@ -122,10 +123,10 @@ result      PASS
 | REST client for symbol rules and depth snapshots: timeouts, HTTP errors with the exchange's message, `Retry-After` on 429 and 418, used IP weight; bodies kept verbatim for recording | `src/net/rest.rs` | tests against a local HTTP server: success, invalid symbol, rate limit, missing filter, timeout, refused connection |
 | WebSocket session: link events and messages as frames with receive times; pings answered; silent connection dropped; reconnect with exponential backoff and jitter. A connection is replaced make-before-break an hour before Binance's 24-hour limit and on the exchange's shutdown notice: the successor connects while the old one still delivers, and the old one closes once the successor has delivered for 5 s, so the book carries on without a gap or a new snapshot (stage 5 of the plan) | `src/net/ws.rs` | tests against a local WebSocket server: close and reconnect, ping and pong, stale link, refused connection, consumer gone; takeover on a shutdown notice, at the age limit, after a failed successor; a recording whose connection is replaced midway keeps one snapshot, no gap and passes `verify` |
 | Parquet tables per `SCHEMA.md`: `depth_diff`, `book_ticker`, `trades`, `book_l20` (sampled every 100 ms of receive time, only while the book is valid), `quality`, `link_rtt`; hourly parts written atomically; a day manifest with row counts, files, quality counts and the share of time with a valid book, merged across runs | `src/tables/` | rows checked against a simulated exchange (every level, trade and sampled book), hour and midnight boundaries, a gap leaves no book rows, merging runs, refusing mixed data; tables from the live recorder equal `convert` of its frames; CI reads them back with pyarrow (`scripts/check_tables.py`) |
-| Verification of a recorded day: seven checks, each PASS, WARN or FAIL. The continuity check needs no frames: it walks the quality journal and the update IDs and fails on an update that skips IDs without a recorded gap, and on a `book_l20` row outside a valid interval, at another update ID than the stream or not a sound book. The rebuild runs the frames of the day and the day before through the pipeline and compares every table, streaming. A crashed run is a warning that names the fix | `src/verify.rs` | a clean live run passes everything; tampered tables are caught: one lost update, a changed price, a book row at the wrong update, a crossed book, a removed resync, a manifest that disagrees, a missing part; crashed runs, unlisted parts and missing frames of the day before give warnings; mutation-tested |
+| Verification of a recorded day: seven checks, each PASS, WARN or FAIL. The continuity check needs no frames: it walks the quality journal and the update IDs and fails on an update that skips IDs without a recorded gap, and on a `book_l20` row outside a valid interval, at another update ID than the stream or not a sound book. The rebuild runs the frames of the day and the day before through the pipeline and compares every table, streaming. A crashed run, or tables derived by older rules (each run records its `derivation`), is a warning that names the fix: `marketrec rebuild` | `src/verify.rs` | a clean live run passes everything; tampered tables are caught: one lost update, a changed price, a book row at the wrong update, a crossed book, a removed resync, a manifest that disagrees, a missing part; crashed runs, unlisted parts and missing frames of the day before give warnings; mutation-tested |
 | Freshness and the link: the lag of every depth update behind its exchange time, in a histogram with three significant digits that adds up exactly across runs and days; `late` and `on_time` quality events when updates arrive more than 1 s late and within 0.5 s again; time in late intervals per day; lag in status lines and summaries, and a `freshness` check in `verify` that warns about stale intervals and about a clock behind the exchange. The session sends its own ping every 5 s and records the round trip (`rtt` frames, `link_rtt` table, no clock agreement needed); `verify` compares round trips inside and outside late intervals and says whether the link was slow or the data was late before it, at the exchange | `src/timing.rs` | thresholds and hysteresis, histogram merge equals one histogram (property test), a simulated 3 s stall gives one late interval of exactly 5 s in quality, manifest and `verify`; late time split at midnight; pings answered by a local server keep a quiet link alive and come back as round trips; a simulated stall with a normal and with a slow round trip gets the two different diagnoses; mutation-tested |
 | Several connections at once: the pipeline knows which connections deliver data; while a new one takes over from an old one, every message is kept from whichever connection brought it first and the copies are dropped and counted; closing one connection while another is open leaves the book valid | `src/pipeline.rs` | a takeover in the middle of a synced session; property test: two complete copies of the stream, batched differently and interleaved in any order, give the exchange's book with every update forwarded once and no gap; tables of a takeover equal those of one connection; mutation-tested |
-| Benchmark of the decode path and a counting allocator (per thread, installed in the binary and the unit tests): the hot path is shown to make no allocation per frame once warmed up, whatever the messages, lags and round trips | `src/bench.rs`, `src/alloc_count.rs` | a test asserts zero allocations over thousands of frames with late intervals and probes; `bench` on a recorded day reports every stage and checks that both books end identical |
+| Benchmark of the decode path and a counting allocator (per thread, installed in the binary and the unit tests): decoding and the pipeline allocate nothing per frame once their buffers have grown; with the ladder book a frame costs no allocation at all, the reference book allocates a tree node for each new price level | `src/bench.rs`, `src/alloc_count.rs` | a test asserts zero allocations over thousands of frames with late intervals and probes; `bench` on a recorded day reports every stage and checks that both books end identical |
 | Operation: free space on the data disk checked before the start and with every status line, with a clean stop and exit code 3 below the limit; systemd units for a recorder per symbol (restart on failure but not on a full disk, hardened) and a nightly `verify` of the day before | `src/record/disk.rs`, `deploy/` | a recording refused on a full disk writes nothing; a disk that fills during a recording stops it early and cleanly, and its day passes `verify`; units checked with `systemd-analyze verify` |
 | Recorder: network, decode and writer threads joined by never-blocking SPSC queues (a full queue drops frames and leaves an `overflow` marker); snapshot requests answered by REST with pacing, `Retry-After` and weight limits; hourly frames files; the writer derives the tables from what it stores; clean stop on Ctrl+C or SIGTERM | `src/record/` | end-to-end test against local servers: a live run and the replay of its files give identical counters, and its tables equal `convert` of its files |
 
@@ -152,7 +153,11 @@ What happens over days:
   part per hour, and `manifest.json` is updated when the day ends.
 - **A crash or a lost network.** systemd restarts the recorder after 10 s, and the new run
   adds to the day it starts in. The crashed run's unfinished files remain; `verify` reports
-  them as a warning, and `marketrec convert` rebuilds that day's tables from the frames.
+  them as a warning, and `marketrec rebuild --day <dir>` derives that day's tables again
+  from the frames.
+- **An upgrade.** Each run in a manifest records the version of the rules that derived its
+  tables. When `verify` finds a difference on a day derived by older rules, it says so and
+  is a warning, not a failure; `marketrec rebuild` derives the day with the current rules.
 - **The disk.** The recorder does not start, and stops cleanly, below 2 GB free
   (`--min-free-gb`). It then exits with code 3, which the unit does not restart.
 - **Every night.** `marketrec-verify@` checks the day before; the report is in
@@ -160,23 +165,22 @@ What happens over days:
 
 ## Performance
 
-`bench` on a synthetic 10-minute day shaped like the first live BTCUSDT run
-(`scripts/synthetic_day.py`), release build, in a 2-core cloud container:
+`bench` on a recorded BTCUSDT day (two runs, 221 371 frames), release build, on a desktop:
 
 ```text
-decode        depth 6000 x 3.39 µs, book ticker 102000 x 0.42 µs, trade 42000 x 0.44 µs (mean per message)
-pipeline      reference    1523968 frames/s; per frame p50 0.50 µs, p99 6.59 µs, p99.9 12.52 µs, max 1.6 ms; 0.022 allocations per frame
-              ladder       1602094 frames/s; per frame p50 0.44 µs, p99 5.36 µs, p99.9 13.04 µs, max 945.33 µs; 0.000 allocations per frame
-book updates  5999 diffs of 35.3 levels after 1 snapshot; reference p50 2.14 µs, p99 2.88 µs, p99.9 16.29 µs, max 29.57 µs; ladder p50 1.62 µs, p99 2.12 µs, p99.9 14.56 µs, max 20.87 µs
+decode        depth 11956 x 1.75 µs, book ticker 154058 x 0.25 µs, trade 55232 x 0.26 µs (mean per message)
+pipeline      reference    2360485 frames/s; per frame p50 0.27 µs, p99 3.69 µs, p99.9 25.29 µs, max 877.47 µs; 0.052 allocations per frame
+              ladder       2246529 frames/s; per frame p50 0.27 µs, p99 4.32 µs, p99.9 26.07 µs, max 607.04 µs; 0.001 allocations per frame
+book updates  11924 diffs of 29.2 levels after 2 snapshots; reference p50 0.47 µs, p99 15.04 µs, p99.9 30.54 µs, max 50.03 µs; ladder p50 0.84 µs, p99 17.29 µs, p99.9 37.20 µs, max 88.62 µs
               the books end identical
 ```
 
-What it says: one core decodes about 1.5 million frames a second against about 260 a second
-live, so the recorder has a margin of several thousand. Decoding the JSON of a depth update
-is the largest cost per message, several times a book update; the ladder book is about a
-quarter faster than the reference book on the updates themselves. The maximum per frame is
-the 5000-level snapshot. Runs on this container vary by about 10%; numbers from a desktop
-will differ, and `bench` on a real recorded day is the measurement that counts.
+What it says: one core runs about 2.3 million frames a second through the pipeline, and the
+live feed brings about 110 to 260 a second, a margin of four orders of magnitude. Decoding the
+JSON of a depth update is the largest cost per message. The ladder book, which had been a
+quarter faster on synthetic updates near the best price (`scripts/synthetic_day.py`), is
+slower on real ones, which reach deep into the book; the recorder uses the reference book.
+The maximum per frame is a 5000-level snapshot.
 
 ## License
 

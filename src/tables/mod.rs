@@ -38,6 +38,13 @@ use builders::Builders;
 use manifest::DayManifest;
 use schema::{L20, SCHEMA_VERSION, Table};
 
+/// Version of the derivation of tables from frames. It goes up whenever the same frames
+/// would give other rows (a new quality kind, a new table, a changed rule); each run in a
+/// manifest records the version it was derived with, so `verify` can tell a difference that
+/// comes from the code from one that comes from the data. 0 in older manifests: before the
+/// version was recorded.
+pub const DERIVATION: u32 = 1;
+
 /// `book_l20` sampling period: one row per 100 ms of receive time while the book is valid.
 pub const L20_PERIOD_NS: i64 = 100_000_000;
 /// Rows per Arrow batch handed to the Parquet writer.

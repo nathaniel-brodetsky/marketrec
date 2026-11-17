@@ -181,7 +181,7 @@ One per day directory.
 | `schema_version` | this contract's version |
 | `symbol`, `date`, `price_step`, `qty_step` | what the directory holds |
 | `host` | machine that wrote the tables |
-| `runs` | each run that wrote to this day: `recorder` (version and commit), `first_recv_ts` and `last_recv_ts`, and `book_at_start`: the book's update ID when the run's data for this day began, if the book was valid then (a run that continues over midnight), else null |
+| `runs` | each run that wrote to this day: `recorder` (version and commit), `first_recv_ts` and `last_recv_ts`, `book_at_start`: the book's update ID when the run's data for this day began, if the book was valid then (a run that continues over midnight), else null, and `derivation`: the version of the rules that derived the tables from the frames (0: written before it was recorded). Rows from runs of different derivations can differ for the same frames; `marketrec rebuild` derives a whole day again with the current rules |
 | `rows` | rows per table |
 | `files` | parts per table, relative to the day directory |
 | `quality` | count of quality events per kind |

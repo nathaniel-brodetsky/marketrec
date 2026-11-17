@@ -1,9 +1,10 @@
 //! Local order book.
 //!
-//! `OrderBook` is the interface every book implements. `RefBook` is the reference: simple
-//! and obviously correct, used as the ground truth in tests and in replay. `LadderBook` is
-//! the fast one the recorder's hot path uses; a property test holds it to the reference
-//! for any sequence of updates, valid or not.
+//! `OrderBook` is the interface every book implements. `RefBook` is the reference: simple,
+//! obviously correct, and on recorded BTCUSDT data also the faster one, so the recorder
+//! uses it. `LadderBook` keeps each side in one vector and allocates nothing once grown;
+//! a property test holds it to the reference for any sequence of updates, and `bench`
+//! measures both on recorded data.
 
 mod ladder;
 mod reference;
