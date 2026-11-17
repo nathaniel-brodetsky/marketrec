@@ -35,9 +35,10 @@ version). Readers reject other format versions.
 |------|----------------|---------------------|--------------------------|
 | 1    | `text`         | connection number   | WebSocket text message   |
 | 2    | `binary`       | connection number   | WebSocket binary message |
-| 3    | `snapshot`     | snapshot request ID | REST depth response body |
+| 3    | `snapshot`     | snapshot request ID: the `recv_ts` of the frame that caused the request | REST depth response body, or `{"error":...}` if the fetch failed |
 | 4    | `connected`    | connection number   | URL                      |
-| 5    | `disconnected` | connection number   | reason                   |
+| 5    | `disconnected` | connection number   | reason; `stopped` if the recorder stopped on purpose |
+| 6    | `overflow`     | frames dropped      | name of the full queue   |
 
 ## Integrity
 

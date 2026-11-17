@@ -44,6 +44,9 @@ pub enum FrameKind {
     Connected = 4,
     /// A connection ended. `aux` is its number, the payload is the reason.
     Disconnected = 5,
+    /// Frames were dropped because a queue was full. `aux` is how many, the payload names
+    /// the queue. Data before and after this point do not connect.
+    Overflow = 6,
 }
 
 impl FrameKind {
@@ -55,6 +58,7 @@ impl FrameKind {
             FrameKind::Snapshot => "snapshot",
             FrameKind::Connected => "connected",
             FrameKind::Disconnected => "disconnected",
+            FrameKind::Overflow => "overflow",
         }
     }
 
@@ -65,6 +69,7 @@ impl FrameKind {
             3 => FrameKind::Snapshot,
             4 => FrameKind::Connected,
             5 => FrameKind::Disconnected,
+            6 => FrameKind::Overflow,
             _ => return None,
         })
     }
@@ -626,6 +631,7 @@ mod tests {
             Just(FrameKind::Snapshot),
             Just(FrameKind::Connected),
             Just(FrameKind::Disconnected),
+            Just(FrameKind::Overflow),
         ]
     }
 

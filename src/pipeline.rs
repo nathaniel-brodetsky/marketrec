@@ -29,7 +29,9 @@ pub enum QualityEvent {
     },
     /// From the book synchronization: gap, stale snapshot, invalid book, overflow, reconnect.
     Sync(Quality),
-    /// The book is valid as of `update_id`; `first` is false after a loss.
+    /// The book is valid as of `update_id`. `first`: the first time on this connection
+    /// (`synced`); otherwise it is valid again after a loss within it (`resync`). Both
+    /// depend only on the frames since the connection started, so every replay agrees.
     Synced {
         update_id: u64,
         first: bool,
@@ -58,6 +60,24 @@ pub enum QualityEvent {
 }
 
 impl QualityEvent {
+    /// Every kind, in the order `SCHEMA.md` lists them.
+    pub const KINDS: [&'static str; 14] = [
+        "connected",
+        "disconnected",
+        "gap",
+        "snapshot_too_old",
+        "invalid_book",
+        "buffer_overflow",
+        "reconnect",
+        "overflow",
+        "synced",
+        "resync",
+        "bbo_mismatch",
+        "undecodable",
+        "snapshot_failed",
+        "server_shutdown",
+    ];
+
     /// Short stable name, the vocabulary of the quality journal.
     pub fn kind(&self) -> &'static str {
         match self {
@@ -68,6 +88,7 @@ impl QualityEvent {
             QualityEvent::Sync(Quality::Invalid(_)) => "invalid_book",
             QualityEvent::Sync(Quality::BufferOverflow { .. }) => "buffer_overflow",
             QualityEvent::Sync(Quality::Reconnect) => "reconnect",
+            QualityEvent::Sync(Quality::Overflow { .. }) => "overflow",
             QualityEvent::Synced { first: true, .. } => "synced",
             QualityEvent::Synced { first: false, .. } => "resync",
             QualityEvent::BboMismatch { .. } => "bbo_mismatch",
@@ -99,6 +120,7 @@ impl std::fmt::Display for QualityEvent {
             QualityEvent::Sync(Quality::Invalid(e)) => write!(f, " {e}"),
             QualityEvent::Sync(Quality::BufferOverflow { len }) => write!(f, " len={len}"),
             QualityEvent::Sync(Quality::Reconnect) => Ok(()),
+            QualityEvent::Sync(Quality::Overflow { dropped }) => write!(f, " dropped={dropped}"),
             QualityEvent::Synced { update_id, .. } => write!(f, " update_id={update_id}"),
             QualityEvent::BboMismatch {
                 update_id,
@@ -133,6 +155,8 @@ pub trait Sink {
     fn book_ticker(&mut self, _recv_ts: i64, _ticker: &BookTicker) {}
     fn trade(&mut self, _recv_ts: i64, _trade: &Trade) {}
     fn quality(&mut self, _recv_ts: i64, _event: &QualityEvent) {}
+    /// After every frame: whether a stream connection is open, and the book if it is valid.
+    fn after_frame(&mut self, _recv_ts: i64, _connected: bool, _book: Option<&dyn OrderBook>) {}
 }
 
 /// Counters for one run. Times are local receive times in nanoseconds.
@@ -153,6 +177,8 @@ pub struct Stats {
     /// Times the book became valid again after having been valid before.
     pub resyncs: u64,
     pub undecodable: u64,
+    /// Frames lost in full queues before they reached the pipeline.
+    pub overflow_frames: u64,
     pub bbo_compared: u64,
     pub bbo_mismatches: u64,
     pub first_ts: Option<i64>,
@@ -197,7 +223,10 @@ pub struct Pipeline<B: OrderBook> {
     pending: [Option<BookTicker>; PENDING_TICKERS],
     stats: Stats,
     synced_since: Option<i64>,
-    ever_synced: bool,
+    /// The book has been valid on the current connection.
+    synced_on_connection: bool,
+    /// The connection that delivers data now.
+    connected: Option<u64>,
 }
 
 impl<B: OrderBook> Pipeline<B> {
@@ -218,7 +247,8 @@ impl<B: OrderBook> Pipeline<B> {
             pending: [None; PENDING_TICKERS],
             stats: Stats::default(),
             synced_since: None,
-            ever_synced: false,
+            synced_on_connection: false,
+            connected: None,
         }
     }
 
@@ -240,10 +270,16 @@ impl<B: OrderBook> Pipeline<B> {
         self.stats.first_ts.get_or_insert(ts);
         self.stats.last_ts = Some(self.stats.last_ts.map_or(ts, |t| t.max(ts)));
         self.actions.clear();
+        self.sync.set_clock(u64::try_from(ts).unwrap_or(0));
         match frame.kind {
             FrameKind::Text => self.on_text(ts, frame.payload, sink),
             FrameKind::Snapshot => self.on_snapshot(ts, frame.aux, frame.payload, sink),
-            FrameKind::Connected => sink.quality(ts, &QualityEvent::Connected { conn: frame.aux }),
+            FrameKind::Connected => {
+                self.connected = Some(frame.aux);
+                self.synced_on_connection = false;
+                sink.quality(ts, &QualityEvent::Connected { conn: frame.aux });
+                self.sync.on_connected(&mut self.actions);
+            }
             FrameKind::Disconnected => {
                 let reason = String::from_utf8_lossy(frame.payload).into_owned();
                 sink.quality(
@@ -253,7 +289,15 @@ impl<B: OrderBook> Pipeline<B> {
                         reason,
                     },
                 );
-                self.sync.on_reconnect(&mut self.actions);
+                // a failed connection attempt never delivered data: nothing to rebuild
+                if self.connected == Some(frame.aux) {
+                    self.connected = None;
+                    if frame.payload == crate::net::ws::STOPPED.as_bytes() {
+                        self.sync.on_stop(); // the end of a recording is not a lost connection
+                    } else {
+                        self.sync.on_reconnect(&mut self.actions);
+                    }
+                }
             }
             FrameKind::Binary => {
                 self.stats.undecodable += 1;
@@ -266,8 +310,14 @@ impl<B: OrderBook> Pipeline<B> {
                     },
                 );
             }
+            FrameKind::Overflow => {
+                self.stats.overflow_frames += frame.aux;
+                self.sync.on_overflow(frame.aux, &mut self.actions);
+            }
         }
         self.drain_actions(ts, sink);
+        let book = (self.sync.state() == State::Synced).then(|| self.sync.book() as &dyn OrderBook);
+        sink.after_frame(ts, self.connected.is_some(), book);
     }
 
     /// Close the run: count the time since the last change of state up to the last frame.
@@ -359,8 +409,8 @@ impl<B: OrderBook> Pipeline<B> {
                     sink.request_snapshot(id);
                 }
                 Action::Synced { update_id } => {
-                    let first = !self.ever_synced;
-                    self.ever_synced = true;
+                    let first = !self.synced_on_connection;
+                    self.synced_on_connection = true;
                     if !first {
                         self.stats.resyncs += 1;
                     }
@@ -585,12 +635,68 @@ mod tests {
             depth(10, 99, 100, &[], &[]),
             depth(20, 101, 102, &[(9900, 6)], &[]),
             ticker(25, 102, (9900, 6), (10100, 2)),
-            snapshot(30, 1, 100),
+            snapshot(30, 10, 100), // answers the request made at 10
             trade(35, 7),
             depth(40, 103, 104, &[], &[(10100, 0)]),
             ticker(45, 104, (9900, 6), (10200, 3)),
             depth(100, 105, 105, &[(9950, 1)], &[]),
         ]
+    }
+
+    #[test]
+    fn kinds_lists_every_kind_once() {
+        use crate::book::BookError;
+        let t = BookTicker {
+            update_id: 1,
+            bid_px: 1,
+            bid_qty: 1,
+            ask_px: 2,
+            ask_qty: 1,
+        };
+        let all = [
+            QualityEvent::Connected { conn: 1 },
+            QualityEvent::Disconnected {
+                conn: 1,
+                reason: String::new(),
+            },
+            QualityEvent::Sync(Quality::Gap {
+                expected: 1,
+                got: 3,
+            }),
+            QualityEvent::Sync(Quality::SnapshotTooOld {
+                snapshot: 1,
+                first_buffered: 3,
+            }),
+            QualityEvent::Sync(Quality::Invalid(BookError::Crossed { bid: 2, ask: 1 })),
+            QualityEvent::Sync(Quality::BufferOverflow { len: 1 }),
+            QualityEvent::Sync(Quality::Reconnect),
+            QualityEvent::Sync(Quality::Overflow { dropped: 1 }),
+            QualityEvent::Synced {
+                update_id: 1,
+                first: true,
+            },
+            QualityEvent::Synced {
+                update_id: 1,
+                first: false,
+            },
+            QualityEvent::BboMismatch {
+                update_id: 1,
+                book_bid: None,
+                book_ask: None,
+                ticker: t,
+            },
+            QualityEvent::Undecodable {
+                kind: FrameKind::Binary,
+                reason: String::new(),
+            },
+            QualityEvent::SnapshotFailed {
+                id: 1,
+                reason: String::new(),
+            },
+            QualityEvent::ServerShutdown { shutdown_ts: 1 },
+        ];
+        let kinds: Vec<&str> = all.iter().map(QualityEvent::kind).collect();
+        assert_eq!(kinds, QualityEvent::KINDS);
     }
 
     #[test]
@@ -603,7 +709,7 @@ mod tests {
             vec![
                 "quality@0 Connected { conn: 1 }",
                 "depth 99-100 Buffered",
-                "request 1",
+                "request 10",
                 "depth 101-102 Buffered",
                 "ticker 102",
                 "quality@30 Synced { update_id: 102, first: true }",
@@ -631,6 +737,43 @@ mod tests {
             "synced from the snapshot at 30 to the last frame at 100"
         );
         assert!((s.synced_share() - 0.7).abs() < 1e-9);
+    }
+
+    #[test]
+    fn requests_are_named_by_the_receive_time_of_their_cause() {
+        let mut frames = normal_start();
+        frames.push(depth(110, 107, 107, &[], &[])); // gap
+        let (_, log) = run(&frames);
+        let requests: Vec<&String> = log.0.iter().filter(|l| l.starts_with("request")).collect();
+        assert_eq!(requests, ["request 10", "request 110"]);
+    }
+
+    #[test]
+    fn replay_from_the_middle_of_a_connection_joins_at_the_next_one() {
+        let mut frames = normal_start();
+        frames.push(link(FrameKind::Disconnected, 110, 1, "connection reset"));
+        frames.push(link(FrameKind::Connected, 120, 2, "wss://example"));
+        frames.push(depth(130, 300, 301, &[(9800, 4)], &[]));
+        frames.push(snapshot(140, 130, 300));
+        frames.push(depth(150, 302, 302, &[], &[(10300, 1)]));
+        let (full, full_log) = run(&frames);
+        // without the connection's start the replay cannot sync, and must not get stuck
+        let (part, part_log) = run(&frames[6..]);
+        assert_eq!(part.state(), State::Synced);
+        assert_eq!(part.book().update_id(), full.book().update_id());
+        let after = |log: &[String]| -> Vec<String> {
+            let i = log
+                .iter()
+                .position(|l| l.contains("Connected { conn: 2 }"))
+                .unwrap();
+            log[i..].to_vec()
+        };
+        assert_eq!(after(&part_log.0), after(&full_log.0));
+        assert_eq!(
+            part.stats().reconnects,
+            0,
+            "the replay saw no connection end"
+        );
     }
 
     #[test]
@@ -678,7 +821,7 @@ mod tests {
     fn gap_and_resync() {
         let mut frames = normal_start();
         frames.push(depth(110, 107, 107, &[], &[])); // 106 is missing
-        frames.push(snapshot(120, 2, 107));
+        frames.push(snapshot(120, 110, 107));
         frames.push(depth(130, 108, 108, &[], &[]));
         let (p, log) = run(&frames);
         assert_eq!(p.state(), State::Synced);
@@ -702,14 +845,73 @@ mod tests {
         frames.push(link(FrameKind::Disconnected, 110, 1, "connection reset"));
         frames.push(link(FrameKind::Connected, 120, 2, "wss://example"));
         frames.push(depth(130, 300, 301, &[], &[]));
-        frames.push(snapshot(140, 2, 300));
+        frames.push(snapshot(140, 130, 300));
         let (p, log) = run(&frames);
         assert_eq!(p.book().update_id(), 301);
-        assert_eq!((p.stats().reconnects, p.stats().resyncs), (1, 1));
+        assert_eq!((p.stats().reconnects, p.stats().resyncs), (1, 0));
+        assert!(
+            log.0
+                .contains(&"quality@140 Synced { update_id: 301, first: true }".to_owned()),
+            "the first valid book of a connection is `synced`"
+        );
         assert!(log.0.contains(
             &r#"quality@110 Disconnected { conn: 1, reason: "connection reset" }"#.to_owned()
         ));
         assert!(log.0.contains(&"quality@110 Sync(Reconnect)".to_owned()));
+    }
+
+    #[test]
+    fn deliberate_stop_ends_the_valid_time_without_counting_a_reconnect() {
+        let mut frames = normal_start();
+        frames.push(link(FrameKind::Disconnected, 150, 1, "stopped"));
+        frames.push(trade(200, 8));
+        let (p, log) = run(&frames);
+        assert_eq!(p.stats().reconnects, 0);
+        assert_eq!(
+            p.stats().synced_ns,
+            150 - 30,
+            "valid from the snapshot until the stop"
+        );
+        assert!(!log.0.iter().any(|l| l.contains("Reconnect")));
+    }
+
+    #[test]
+    fn failed_connection_attempts_do_not_reset_the_book() {
+        let mut frames = normal_start();
+        frames.push(link(
+            FrameKind::Disconnected,
+            110,
+            7,
+            "connect failed: refused",
+        ));
+        let (p, log) = run(&frames);
+        assert_eq!(
+            p.state(),
+            State::Synced,
+            "connection 7 never delivered data"
+        );
+        assert_eq!(p.stats().reconnects, 0);
+        assert!(
+            log.0.contains(
+                &r#"quality@110 Disconnected { conn: 7, reason: "connect failed: refused" }"#
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn overflow_marker_rebuilds_the_book() {
+        let mut frames = normal_start();
+        frames.push(link(FrameKind::Overflow, 110, 42, "network queue"));
+        frames.push(depth(120, 200, 201, &[], &[]));
+        frames.push(snapshot(130, 120, 200));
+        let (p, log) = run(&frames);
+        assert_eq!(p.book().update_id(), 201);
+        assert_eq!((p.stats().overflow_frames, p.stats().resyncs), (42, 1));
+        assert!(
+            log.0
+                .contains(&"quality@110 Sync(Overflow { dropped: 42 })".to_owned())
+        );
     }
 
     #[test]
@@ -735,11 +937,11 @@ mod tests {
             OwnedFrame {
                 kind: FrameKind::Snapshot,
                 recv_ts: 28,
-                aux: 1,
+                aux: 10,
                 payload: br#"{"code":-1003,"msg":"Too many requests"}"#.to_vec(),
             },
         );
-        frames[5] = snapshot(30, 2, 100);
+        frames[5] = snapshot(30, 28, 100); // asked again at the failure
         let (p, log) = run(&frames);
         assert_eq!(p.state(), State::Synced);
         assert_eq!(
@@ -749,7 +951,7 @@ mod tests {
         assert!(
             log.0
                 .iter()
-                .any(|l| l.starts_with("quality@28 SnapshotFailed { id: 1"))
+                .any(|l| l.starts_with("quality@28 SnapshotFailed { id: 10,"))
         );
     }
 
@@ -768,7 +970,7 @@ mod tests {
     fn same_frames_same_output() {
         let mut frames = normal_start();
         frames.push(depth(110, 107, 107, &[], &[]));
-        frames.push(snapshot(120, 2, 107));
+        frames.push(snapshot(120, 110, 107));
         let (a, log_a) = run(&frames);
         let (b, log_b) = run(&frames);
         assert_eq!(log_a.0, log_b.0);

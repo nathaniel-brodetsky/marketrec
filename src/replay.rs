@@ -15,7 +15,7 @@ use crate::book::{OrderBook, RefBook, Side};
 use crate::decimal::{Grid, write_atoms};
 use crate::event::Level;
 use crate::frames::text::{TextError, TextReader};
-use crate::frames::{FramesError, FramesReader, Header, MAGIC};
+use crate::frames::{Frame, FramesError, FramesReader, Header, MAGIC};
 use crate::pipeline::{Pipeline, PipelineError, QualityEvent, Sink, Stats};
 use crate::sync::{State, SyncConfig};
 
@@ -105,41 +105,105 @@ impl Sink for Collect {
     }
 }
 
-pub fn replay_file(path: &Path) -> Result<Report, ReplayError> {
-    let mut input = BufReader::with_capacity(1 << 20, File::open(path)?);
-    if input.fill_buf()?.starts_with(&MAGIC) {
-        replay_binary(input)
-    } else {
-        replay_text(input)
+/// A frames file in either form, read frame by frame.
+pub struct Input<R: BufRead> {
+    form: InputForm,
+    header: Header,
+    reader: Reader<R>,
+}
+
+enum Reader<R: BufRead> {
+    Binary(FramesReader<R>),
+    Text(TextReader<R>),
+}
+
+impl Input<BufReader<File>> {
+    pub fn open(path: &Path) -> Result<Self, ReplayError> {
+        Input::new(BufReader::with_capacity(1 << 20, File::open(path)?))
     }
 }
 
-pub fn replay_binary(input: impl io::Read) -> Result<Report, ReplayError> {
-    let mut reader = FramesReader::new(input).map_err(ReplayError::Frames)?;
-    let header = reader.header().clone();
-    let mut run = Run::new(&header)?;
-    let ending = loop {
-        match reader.next_frame() {
-            Ok(Some(frame)) => run.pipeline.on_frame(frame, &mut run.sink),
-            Ok(None) => break Ending::Clean,
-            Err(FramesError::Truncated { offset }) => break Ending::Truncated { offset },
-            Err(FramesError::Corrupt { offset, reason }) => {
-                break Ending::Corrupt { offset, reason };
-            }
-            Err(e) => return Err(ReplayError::Frames(e)),
+impl<R: BufRead> Input<R> {
+    /// Detects the form by the magic bytes and reads the header.
+    pub fn new(mut input: R) -> Result<Self, ReplayError> {
+        if input.fill_buf()?.starts_with(&MAGIC) {
+            let reader = FramesReader::new(input).map_err(ReplayError::Frames)?;
+            Ok(Self {
+                form: InputForm::Binary,
+                header: reader.header().clone(),
+                reader: Reader::Binary(reader),
+            })
+        } else {
+            let reader = TextReader::new(input).map_err(ReplayError::Text)?;
+            Ok(Self {
+                form: InputForm::Text,
+                header: reader.header().clone(),
+                reader: Reader::Text(reader),
+            })
         }
-    };
-    Ok(run.finish(InputForm::Binary, header, ending))
+    }
+
+    pub fn form(&self) -> InputForm {
+        self.form
+    }
+
+    pub fn header(&self) -> &Header {
+        &self.header
+    }
+
+    /// Hand every frame to `f`. A binary file that ends inside a record or has a damaged
+    /// record stops there and says so in the `Ending`; a bad line in the text form is an
+    /// error, since text files are written by hand or by `frames dump`, never by a crash.
+    pub fn for_each(&mut self, mut f: impl FnMut(Frame<'_>)) -> Result<Ending, ReplayError> {
+        self.for_each_while(|frame| {
+            f(frame);
+            true
+        })
+    }
+
+    /// `for_each` that stops, with a clean ending, when `f` returns false.
+    pub fn for_each_while(
+        &mut self,
+        mut f: impl FnMut(Frame<'_>) -> bool,
+    ) -> Result<Ending, ReplayError> {
+        match &mut self.reader {
+            Reader::Binary(r) => loop {
+                match r.next_frame() {
+                    Ok(Some(frame)) => {
+                        if !f(frame) {
+                            return Ok(Ending::Clean);
+                        }
+                    }
+                    Ok(None) => return Ok(Ending::Clean),
+                    Err(FramesError::Truncated { offset }) => {
+                        return Ok(Ending::Truncated { offset });
+                    }
+                    Err(FramesError::Corrupt { offset, reason }) => {
+                        return Ok(Ending::Corrupt { offset, reason });
+                    }
+                    Err(e) => return Err(ReplayError::Frames(e)),
+                }
+            },
+            Reader::Text(r) => {
+                while let Some(frame) = r.next_frame().map_err(ReplayError::Text)? {
+                    if !f(frame.as_frame()) {
+                        break;
+                    }
+                }
+                Ok(Ending::Clean)
+            }
+        }
+    }
 }
 
-pub fn replay_text(input: impl BufRead) -> Result<Report, ReplayError> {
-    let mut reader = TextReader::new(input).map_err(ReplayError::Text)?;
-    let header = reader.header().clone();
-    let mut run = Run::new(&header)?;
-    while let Some(frame) = reader.next_frame().map_err(ReplayError::Text)? {
-        run.pipeline.on_frame(frame.as_frame(), &mut run.sink);
-    }
-    Ok(run.finish(InputForm::Text, header, Ending::Clean))
+pub fn replay_file(path: &Path) -> Result<Report, ReplayError> {
+    replay(Input::open(path)?)
+}
+
+pub fn replay<R: BufRead>(mut input: Input<R>) -> Result<Report, ReplayError> {
+    let mut run = Run::new(input.header())?;
+    let ending = input.for_each(|frame| run.pipeline.on_frame(frame, &mut run.sink))?;
+    Ok(run.finish(input.form(), input.header().clone(), ending))
 }
 
 struct Run {

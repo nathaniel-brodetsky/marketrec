@@ -16,6 +16,12 @@
 //!
 //! The state machine does no I/O. It reports what the caller must do through `Action`s,
 //! which also carry the data-quality events.
+//!
+//! Snapshot requests are named by the caller's clock (`set_clock`): the pipeline sets it to
+//! the receive time of the frame being processed, so a request's ID depends only on the
+//! frame that caused it. A replay that starts in the middle of a recording therefore asks
+//! for the same IDs as the live run once both have seen the same connection start, and from
+//! there on accepts the same recorded snapshots.
 
 use crate::book::{BookError, OrderBook};
 use crate::event::{DepthDiff, Snapshot};
@@ -39,6 +45,8 @@ pub enum Quality {
     BufferOverflow { len: usize },
     /// The connection was lost; the book is rebuilt from scratch.
     Reconnect,
+    /// `dropped` frames were lost in a full queue; the book is rebuilt from scratch.
+    Overflow { dropped: u64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,7 +91,9 @@ pub struct BookSync<B> {
     buffer: Vec<DepthDiff>,
     /// ID of the snapshot request whose answer is awaited; answers to other IDs are stale.
     awaiting: Option<u64>,
+    /// Lowest ID the next request may take; IDs strictly increase.
     next_request: u64,
+    clock: u64,
     cfg: SyncConfig,
 }
 
@@ -96,8 +106,15 @@ impl<B: OrderBook> BookSync<B> {
             buffer: Vec::new(),
             awaiting: None,
             next_request: 1,
+            clock: 0,
             cfg,
         }
+    }
+
+    /// The current time; the next snapshot request takes it as its ID (or the previous ID
+    /// plus one, if that is larger). Without a clock IDs count 1, 2, 3, ...
+    pub fn set_clock(&mut self, now: u64) {
+        self.clock = now;
     }
 
     pub fn state(&self) -> State {
@@ -175,9 +192,33 @@ impl<B: OrderBook> BookSync<B> {
         }
     }
 
+    /// A new connection starts. Live, the end of the previous one has already restarted
+    /// synchronization and this does nothing. If the book is still valid, that end was never
+    /// seen: the book is dropped as on a reconnect. A replay that started in the middle of a
+    /// connection drops what it collected without a snapshot, silently, and from here on
+    /// behaves as the live run did.
+    pub fn on_connected(&mut self, out: &mut Vec<Action>) {
+        if self.state == State::Synced {
+            self.on_reconnect(out);
+        } else if !self.buffer.is_empty() || self.awaiting.is_some() {
+            self.restart(None, self.state);
+        }
+    }
+
     /// The connection was lost: everything is rebuilt from the next diff.
     pub fn on_reconnect(&mut self, out: &mut Vec<Action>) {
         out.push(Action::Quality(Quality::Reconnect));
+        self.restart(None, State::Resyncing);
+    }
+
+    /// Recording stops on purpose: the book is no longer maintained, which is not a loss.
+    pub fn on_stop(&mut self) {
+        self.restart(None, State::Resyncing);
+    }
+
+    /// Frames were lost before reaching this point: everything is rebuilt from the next diff.
+    pub fn on_overflow(&mut self, dropped: u64, out: &mut Vec<Action>) {
+        out.push(Action::Quality(Quality::Overflow { dropped }));
         self.restart(None, State::Resyncing);
     }
 
@@ -228,8 +269,8 @@ impl<B: OrderBook> BookSync<B> {
     }
 
     fn request(&mut self, out: &mut Vec<Action>) {
-        let id = self.next_request;
-        self.next_request += 1;
+        let id = self.next_request.max(self.clock);
+        self.next_request = id + 1;
         self.awaiting = Some(id);
         out.push(Action::RequestSnapshot { id });
     }
@@ -677,5 +718,49 @@ mod tests {
         fn synced_book_always_equals_the_exchange(steps in proptest::collection::vec(step(), 1..120)) {
             simulate(&steps)?;
         }
+    }
+
+    #[test]
+    fn request_ids_follow_the_clock_and_always_increase() {
+        let mut sync = BookSync::new(RefBook::new(), SyncConfig::default());
+        let mut out = Vec::new();
+        sync.set_clock(500);
+        sync.on_diff(&diff(5, 6, &[], &[]), &mut out);
+        sync.on_snapshot_failed(500, &mut out);
+        sync.set_clock(400); // a clock that went back still gives a new ID
+        sync.on_diff(&diff(7, 7, &[], &[]), &mut out);
+        sync.on_snapshot_failed(501, &mut out);
+        let ids: Vec<u64> = out
+            .iter()
+            .filter_map(|a| match a {
+                Action::RequestSnapshot { id } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, [500, 501, 502]);
+    }
+
+    #[test]
+    fn a_new_connection_drops_what_has_no_snapshot_and_a_book_whose_end_was_missed() {
+        let mut sync = BookSync::new(RefBook::new(), SyncConfig::default());
+        let mut out = Vec::new();
+        sync.on_diff(&diff(5, 6, &[], &[]), &mut out);
+        out.clear();
+        sync.on_connected(&mut out);
+        assert!(out.is_empty(), "silent: nothing valid is lost");
+        sync.on_snapshot(1, &snapshot(6), &mut out);
+        assert_eq!(sync.state(), State::Buffering, "the old request is stale");
+
+        let mut fresh = BookSync::new(RefBook::new(), SyncConfig::default());
+        fresh.on_connected(&mut out);
+        assert!(out.is_empty());
+
+        sync.on_diff(&diff(7, 8, &[], &[]), &mut out);
+        sync.on_snapshot(2, &snapshot(7), &mut out);
+        assert_eq!(sync.state(), State::Synced);
+        out.clear();
+        sync.on_connected(&mut out);
+        assert_eq!(out, [Action::Quality(Quality::Reconnect)]);
+        assert_eq!(sync.state(), State::Resyncing);
     }
 }

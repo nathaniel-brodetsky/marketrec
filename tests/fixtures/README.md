@@ -2,8 +2,9 @@
 
 Each file is a frames file in its text form (`docs/FRAMES.md`): a header line, then the
 frames in arrival order. Symbol BTCUSDT, tick 0.01, step 0.00001, feed times in
-microseconds, receive times from 2026-11-21 00:00:00 UTC. The snapshot answering request
-`n` is the `snapshot` frame with `"aux":n`.
+microseconds, receive times from 2026-11-21 00:00:00 UTC. A snapshot request is named by
+the receive time of the frame that caused it, and the `snapshot` frame answering it carries
+that number in `aux`.
 
 Run one: `cargo run -- replay --input tests/fixtures/gap.jsonl --events`.
 Expected results are asserted in `tests/replay.rs`.
@@ -17,7 +18,7 @@ Expected results are asserted in `tests/replay.rs`.
 | `duplicate.jsonl` | the same diff arrives twice | applied once |
 | `out_of_order.jsonl` | 1006-1007 arrives before 1004-1005 | `gap`, `resync` |
 | `zero_quantity.jsonl` | the best bid is set to 0 | level removed, ticker confirms |
-| `reconnect.jsonl` | the connection drops, a new one opens | `disconnected`, `reconnect`, `resync` |
+| `reconnect.jsonl` | the connection drops, a new one opens | `disconnected`, `reconnect`, `connected`, `synced` on the new connection |
 | `broken_frame.jsonl` | a depth message is cut off | `undecodable`; its loss shows as a `gap`; `resync` |
 | `bbo_mismatch.jsonl` | the book ticker disagrees with the book at the same update ID | `bbo_mismatch` |
 | `crossed_book.jsonl` | a diff would put the best bid above the best ask | `invalid_book`, `resync` |

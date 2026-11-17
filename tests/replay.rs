@@ -16,6 +16,12 @@ fn fixture(name: &str) -> PathBuf {
         .join(format!("{name}.jsonl"))
 }
 
+/// Receive time of a fixture frame `ms` milliseconds after the start, which is also the ID
+/// of a snapshot request that frame caused.
+fn at(ms: u64) -> u64 {
+    1_795_219_200_000_000_000 + ms * 1_000_000
+}
+
 fn replay(name: &str) -> Report {
     let r = replay_file(&fixture(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
     assert_eq!(r.form, InputForm::Text);
@@ -37,7 +43,7 @@ fn assert_book(r: &Report, update_id: u64, bid: Option<Level>, ask: Option<Level
 fn normal_start() {
     let r = replay("normal_start");
     assert_eq!(r.event_kinds(), ["connected", "synced"]);
-    assert_eq!(r.requests, [1]);
+    assert_eq!(r.requests, [at(5)], "asked at the first diff");
     assert_book(&r, 1007, lv(9712346, 1000), lv(9712347, 90000));
     let s = &r.stats;
     assert_eq!((s.depth_buffered, s.depth_applied, s.trades), (2, 2, 1));
@@ -52,7 +58,11 @@ fn normal_start() {
 fn snapshot_older_than_buffer_is_requested_again() {
     let r = replay("stale_snapshot");
     assert_eq!(r.event_kinds(), ["connected", "snapshot_too_old", "synced"]);
-    assert_eq!(r.requests, [1, 2]);
+    assert_eq!(
+        r.requests,
+        [at(5), at(60)],
+        "asked again when the old snapshot came"
+    );
     assert_book(&r, 1004, lv(9712345, 20000), lv(9712346, 30000));
 }
 
@@ -68,7 +78,11 @@ fn buffered_events_older_than_snapshot_are_dropped() {
 fn missed_event_causes_gap_and_resync() {
     let r = replay("gap");
     assert_eq!(r.event_kinds(), ["connected", "synced", "gap", "resync"]);
-    assert_eq!(r.requests, [1, 2]);
+    assert_eq!(
+        r.requests,
+        [at(5), at(305)],
+        "asked again at the diff after the gap"
+    );
     assert_eq!((r.stats.gaps, r.stats.resyncs), (1, 1));
     assert_book(&r, 1009, lv(9712345, 15000), lv(9712346, 31000));
 }
@@ -106,12 +120,12 @@ fn reconnect_rebuilds_the_book() {
             "disconnected",
             "reconnect",
             "connected",
-            "resync"
+            "synced"
         ]
     );
     assert_eq!(
         (r.stats.reconnects, r.stats.resyncs, r.stats.gaps),
-        (1, 1, 0)
+        (1, 0, 0)
     );
     assert_book(&r, 1012, lv(9712345, 10000), lv(9712346, 20000));
 }

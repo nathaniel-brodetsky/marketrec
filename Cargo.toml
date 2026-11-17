@@ -9,12 +9,19 @@ repository = "https://github.com/nathaniel-brodetsky/marketrec"
 publish = false
 
 [dependencies]
+arrow-array = "60"
+arrow-schema = "60"
+arrow-select = "60"
 clap = { version = "4", features = ["derive"] }
 crc32fast = "1"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+parquet = { version = "60", default-features = false, features = ["arrow", "zstd"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+rtrb = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
-tokio = { version = "1", features = ["rt", "net", "time", "macros", "sync", "io-util"] }
+tokio = { version = "1", features = ["rt", "net", "time", "macros", "sync", "io-util", "signal"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 
 [profile.release]
 debug = 1

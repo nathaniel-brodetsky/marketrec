@@ -21,3 +21,11 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: test
         run: cargo test --all-targets
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: tables are readable by another implementation
+        run: |
+          pip install --quiet pyarrow==20.0.0
+          cargo run --quiet -- convert --input tests/fixtures/reconnect.jsonl --out "$RUNNER_TEMP/tables"
+          python3 scripts/check_tables.py "$RUNNER_TEMP/tables/binance/BTCUSDT"

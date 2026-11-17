@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Write};
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -20,18 +20,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum Command {
-    /// Record one symbol from Binance into the data directory.
-    Record {
-        /// Symbol as Binance names it, for example BTCUSDT.
-        #[arg(long)]
-        symbol: String,
-        /// Which feed to record.
-        #[arg(long, value_enum, default_value_t = Protocol::Json)]
-        protocol: Protocol,
-        /// Root of the data directory.
-        #[arg(long, default_value = "data")]
-        out: PathBuf,
-    },
+    /// Record one symbol from Binance into the data directory until Ctrl+C.
+    Record(RecordArgs),
     /// Feed recorded frames through the same hot path as the live feed, without network,
     /// and print a summary. Accepts binary frames files and their JSON Lines form.
     Replay {
@@ -42,11 +32,29 @@ pub enum Command {
         #[arg(long)]
         events: bool,
     },
-    /// Check a recorded day: continuity, row counts against the manifest, book rebuild.
+    /// Build the Parquet tables from frames files, as the recorder does live. Use it for
+    /// recordings made before a schema change, or to check the live tables.
+    Convert {
+        /// A frames file, or a directory searched for `*.frames` and `*.jsonl` files.
+        #[arg(long)]
+        input: PathBuf,
+        /// Root of a data directory without tables for this symbol yet.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Check a recorded day: manifest and files, continuity of the update stream, and a
+    /// rebuild of every table from the frames. Exits with 1 if a check fails.
     Verify {
         /// Directory of one recorded day, for example data/binance/BTCUSDT/2026-11-21.
         #[arg(long)]
         day: PathBuf,
+        /// Skip the rebuild from frames.
+        #[arg(long)]
+        quick: bool,
+        /// Directory for the rebuilt tables (removed afterwards); the system's temporary
+        /// directory if omitted. The rebuild needs about as much space as two days of tables.
+        #[arg(long)]
+        scratch: Option<PathBuf>,
     },
     /// Run performance experiments on a recorded day.
     Bench {
@@ -74,6 +82,15 @@ pub enum Command {
         #[arg(long, default_value = crate::net::rest::DEFAULT_BASE)]
         rest_url: String,
     },
+    /// Connect to the live stream for a while and count what arrives. Records nothing.
+    Listen {
+        #[arg(long)]
+        symbol: String,
+        #[arg(long, default_value_t = 10)]
+        seconds: u64,
+        #[arg(long, default_value = crate::net::ws::DEFAULT_BASE)]
+        ws_url: String,
+    },
     /// Convert frames files between the binary form and readable JSON Lines.
     Frames {
         #[command(subcommand)]
@@ -100,6 +117,32 @@ pub enum FramesAction {
     },
 }
 
+#[derive(Debug, Args, PartialEq, Eq)]
+pub struct RecordArgs {
+    /// Symbol as Binance names it, for example BTCUSDT.
+    #[arg(long)]
+    pub symbol: String,
+    /// Which feed to record.
+    #[arg(long, value_enum, default_value_t = Protocol::Json)]
+    pub protocol: Protocol,
+    /// Root of the data directory.
+    #[arg(long, default_value = "data")]
+    pub out: PathBuf,
+    /// Stop after this many seconds instead of waiting for Ctrl+C.
+    #[arg(long)]
+    pub seconds: Option<u64>,
+    /// Levels per side in each REST snapshot (weight 250 for 1001-5000, 50 for 501-1000).
+    #[arg(long, default_value_t = 5000)]
+    pub depth_limit: u32,
+    /// Seconds between status lines.
+    #[arg(long, default_value_t = 10)]
+    pub status_every: u64,
+    #[arg(long, default_value = crate::net::rest::DEFAULT_BASE)]
+    pub rest_url: String,
+    #[arg(long, default_value = crate::net::ws::DEFAULT_BASE)]
+    pub ws_url: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Protocol {
     /// Text frames from stream.binance.com.
@@ -118,9 +161,13 @@ pub enum CliError {
     Text(crate::frames::text::TextError),
     Replay(crate::replay::ReplayError),
     Rest(crate::net::rest::RestError),
+    Record(crate::record::RecordError),
     Decode(crate::json::DecodeError),
+    Convert(crate::tables::convert::ConvertError),
     /// The input contains a damaged record; everything before it was processed.
     Damaged,
+    /// `verify` found a failing check; the report says which.
+    VerifyFailed,
 }
 
 impl fmt::Display for CliError {
@@ -131,8 +178,11 @@ impl fmt::Display for CliError {
             CliError::Text(e) => write!(f, "{e}"),
             CliError::Replay(e) => write!(f, "{e}"),
             CliError::Rest(e) => write!(f, "{e}"),
+            CliError::Record(e) => write!(f, "{e}"),
             CliError::Decode(e) => write!(f, "{e}"),
+            CliError::Convert(e) => write!(f, "{e}"),
             CliError::Damaged => write!(f, "the input contains a damaged record"),
+            CliError::VerifyFailed => write!(f, "verification failed"),
         }
     }
 }
@@ -154,9 +204,31 @@ impl From<crate::frames::text::TextError> for CliError {
 /// Run one command. Progress and summaries go to standard error.
 pub fn run(command: Command) -> Result<(), CliError> {
     match command {
-        Command::Record { .. } => Err(CliError::NotImplemented("record")),
+        Command::Record(args) => run_record(args),
         Command::Replay { input, events } => run_replay(&input, events),
-        Command::Verify { .. } => Err(CliError::NotImplemented("verify")),
+        Command::Convert { input, out } => {
+            let summary =
+                crate::tables::convert::convert(&input, &out, &crate::record::recorder_id())
+                    .map_err(CliError::Convert)?;
+            println!("{summary}");
+            if summary.damaged().next().is_some() {
+                return Err(CliError::Damaged);
+            }
+            Ok(())
+        }
+        Command::Verify {
+            day,
+            quick,
+            scratch,
+        } => {
+            let report =
+                crate::verify::verify_day(&day, &crate::verify::VerifyOptions { quick, scratch });
+            println!("{report}");
+            if report.outcome() == crate::verify::Outcome::Fail {
+                return Err(CliError::VerifyFailed);
+            }
+            Ok(())
+        }
         Command::Bench { .. } => Err(CliError::NotImplemented("bench")),
         Command::Frames { action } => run_frames(action),
         Command::Info { symbol, rest_url } => {
@@ -165,6 +237,23 @@ pub fn run(command: Command) -> Result<(), CliError> {
                 "{} {}: tick size {}, step size {}",
                 info.symbol, info.status, info.tick_size, info.step_size
             );
+            Ok(())
+        }
+        Command::Listen {
+            symbol,
+            seconds,
+            ws_url,
+        } => {
+            let url = crate::net::ws::stream_url(&ws_url, &symbol, crate::json::TimeUnit::Micro);
+            let cfg = crate::net::ws::WsConfig::new(url);
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let summary = rt.block_on(crate::net::listen::listen(
+                cfg,
+                std::time::Duration::from_secs(seconds),
+            ));
+            println!("{summary}");
             Ok(())
         }
         Command::Snapshot {
@@ -260,6 +349,44 @@ fn snapshot_report(
     Ok(out)
 }
 
+fn run_record(args: RecordArgs) -> Result<(), CliError> {
+    use crate::record::{Progress, RecordConfig, record};
+    use crate::time::Utc;
+
+    if args.protocol != Protocol::Json {
+        return Err(CliError::NotImplemented("record --protocol sbe|both"));
+    }
+    let mut cfg = RecordConfig::new(&args.symbol, args.out);
+    cfg.duration = args.seconds.map(std::time::Duration::from_secs);
+    cfg.fetch.limit = args.depth_limit;
+    cfg.status_every = std::time::Duration::from_secs(args.status_every.max(1));
+    cfg.rest_base = args.rest_url;
+    cfg.ws_base = args.ws_url;
+    eprintln!("recording {}, stop with Ctrl+C", cfg.symbol);
+    let summary = record(cfg, |p| match p {
+        Progress::Status(s) => eprintln!("{s}"),
+        Progress::Quality(ts, e) => {
+            let t = Utc::from_ns(ts);
+            eprintln!(
+                "{} {}.{:03} {e}",
+                t.date(),
+                t.time().replace('-', ":"),
+                ts.rem_euclid(1_000_000_000) / 1_000_000
+            );
+        }
+        Progress::Fatal(m) => eprintln!("FATAL: {m}"),
+    })
+    .map_err(CliError::Record)?;
+    print!("{summary}");
+    if let Some(first) = summary.files.first() {
+        println!(
+            "check it with: marketrec replay --input {}",
+            first.display()
+        );
+    }
+    Ok(())
+}
+
 fn run_replay(input: &std::path::Path, events: bool) -> Result<(), CliError> {
     let report = crate::replay::replay_file(input).map_err(CliError::Replay)?;
     let mut out = io::stdout().lock();
@@ -323,18 +450,20 @@ mod tests {
 
     #[test]
     fn record_defaults() {
+        let Command::Record(a) = parse(&["marketrec", "record", "--symbol", "BTCUSDT"]) else {
+            panic!("not record")
+        };
         assert_eq!(
-            parse(&["marketrec", "record", "--symbol", "BTCUSDT"]),
-            Command::Record {
-                symbol: "BTCUSDT".into(),
-                protocol: Protocol::Json,
-                out: PathBuf::from("data"),
-            }
+            (a.symbol.as_str(), a.protocol, a.out.as_path()),
+            ("BTCUSDT", Protocol::Json, std::path::Path::new("data"))
         );
+        assert_eq!((a.seconds, a.depth_limit, a.status_every), (None, 5000, 10));
+        assert_eq!(a.rest_url, crate::net::rest::DEFAULT_BASE);
+        assert_eq!(a.ws_url, crate::net::ws::DEFAULT_BASE);
     }
 
     #[test]
-    fn record_with_both_protocols() {
+    fn record_with_options() {
         let cmd = parse(&[
             "marketrec",
             "record",
@@ -344,14 +473,22 @@ mod tests {
             "both",
             "--out",
             "/tmp/d",
+            "--seconds",
+            "60",
+            "--depth-limit",
+            "1000",
         ]);
+        let Command::Record(a) = cmd else {
+            panic!("not record")
+        };
         assert_eq!(
-            cmd,
-            Command::Record {
-                symbol: "ETHUSDT".into(),
-                protocol: Protocol::Both,
-                out: PathBuf::from("/tmp/d"),
-            }
+            (a.protocol, a.seconds, a.depth_limit),
+            (Protocol::Both, Some(60), 1000)
+        );
+        assert_eq!(a.out, PathBuf::from("/tmp/d"));
+        assert!(
+            matches!(run(Command::Record(a)), Err(CliError::NotImplemented(_))),
+            "SBE comes later"
         );
     }
 
@@ -376,9 +513,33 @@ mod tests {
     }
 
     #[test]
+    fn convert_takes_input_and_output() {
+        assert_eq!(
+            parse(&["marketrec", "convert", "--input", "a", "--out", "b"]),
+            Command::Convert {
+                input: "a".into(),
+                out: "b".into()
+            }
+        );
+        assert!(Cli::try_parse_from(["marketrec", "convert", "--input", "a"]).is_err());
+    }
+
+    #[test]
     fn stubs_say_what_is_missing() {
-        let err = run(parse(&["marketrec", "verify", "--day", "x"])).unwrap_err();
-        assert_eq!(err.to_string(), "`verify` is not implemented yet");
+        let err = run(parse(&["marketrec", "bench", "--day", "x"])).unwrap_err();
+        assert_eq!(err.to_string(), "`bench` is not implemented yet");
+    }
+
+    #[test]
+    fn verify_of_a_missing_day_fails() {
+        let cmd = parse(&[
+            "marketrec",
+            "verify",
+            "--day",
+            "/nonexistent/2026-11-21",
+            "--quick",
+        ]);
+        assert!(matches!(run(cmd), Err(CliError::VerifyFailed)));
     }
 
     #[test]
