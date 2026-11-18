@@ -345,8 +345,17 @@ pub fn run(command: Command) -> Result<(), CliError> {
                 }
             };
             let key = std::env::var("TARDIS_API_KEY").ok();
-            let r = crate::tardis::tardis_day(&tardis_url, key, &date, &symbol, &out, steps, false)
-                .map_err(CliError::Import)?;
+            let r = crate::tardis::tardis_day(
+                &tardis_url,
+                key,
+                crate::tardis::Retry::default(),
+                &date,
+                &symbol,
+                &out,
+                steps,
+                false,
+            )
+            .map_err(CliError::Import)?;
             println!("{r}");
             if r.rebuilt.verify.outcome() == crate::verify::Outcome::Fail {
                 return Err(CliError::VerifyFailed);

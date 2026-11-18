@@ -151,6 +151,9 @@ cargo run --release -- import tardis --date 2026-11-01 --symbol BTCUSDT --out da
   it, which the connection's first depth update causes. A snapshot received before that
   update follows it one nanosecond later. Our book synchronization then checks it like
   any other: a snapshot that does not fit the updates is reported, not forced.
+- A failed request is tried again for about four minutes, waiting longer each time. If the
+  download fails anyway, the frames written so far are removed, so the day can simply be
+  imported again.
 - The steps come from Binance's current rules unless `--price-step` and `--qty-step` are
   given. Other days need a key, read from the environment variable `TARDIS_API_KEY`.
 - The receive times are theirs: the lag in the manifest is that of a machine in Tokyo, and

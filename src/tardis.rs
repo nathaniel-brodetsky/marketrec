@@ -70,7 +70,9 @@ impl fmt::Display for ImportError {
             ImportError::BadDate(d) => write!(f, "{d} is not a date (YYYY-MM-DD)"),
             ImportError::Exists(p) => write!(
                 f,
-                "{} already holds frames; an import goes into a day without any",
+                "{} already holds frames; an import goes into a day without any \
+                 (to import it again: rm -r {})",
+                p.display(),
                 p.display()
             ),
             ImportError::NoData => write!(f, "Tardis.dev returned no messages of the symbol"),
@@ -328,15 +330,36 @@ pub fn convert_lines(
     Ok(())
 }
 
+/// How long to keep trying a request that failed in a way that may pass.
+#[derive(Debug, Clone, Copy)]
+pub struct Retry {
+    pub attempts: u32,
+    pub first_wait: Duration,
+    pub max_wait: Duration,
+}
+
+impl Default for Retry {
+    /// Ten attempts, waiting 1, 2, 4 ... up to 60 s between them: about four minutes in all,
+    /// enough for a home connection to come back.
+    fn default() -> Self {
+        Self {
+            attempts: 10,
+            first_wait: Duration::from_secs(1),
+            max_wait: Duration::from_secs(60),
+        }
+    }
+}
+
 /// The raw API of Tardis.dev for one exchange.
 pub struct Source {
     http: reqwest::Client,
     base: String,
     key: Option<String>,
+    retry: Retry,
 }
 
 impl Source {
-    pub fn new(base: &str, key: Option<String>) -> Result<Self, ImportError> {
+    pub fn new(base: &str, key: Option<String>, retry: Retry) -> Result<Self, ImportError> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(120))
             .user_agent(concat!("marketrec/", env!("CARGO_PKG_VERSION")))
@@ -345,11 +368,12 @@ impl Source {
             http,
             base: base.trim_end_matches('/').to_owned(),
             key: key.filter(|k| !k.is_empty()),
+            retry,
         })
     }
 
-    /// `minutes` minutes of `symbol` from minute `offset` of `date`, decompressed. Retried a
-    /// few times on errors that may pass: lost connections, 429 and 5xx.
+    /// `minutes` minutes of `symbol` from minute `offset` of `date`, decompressed. Retried on
+    /// errors that may pass (lost connections, 429 and 5xx) as `Retry` says.
     pub async fn slice(
         &self,
         date: &str,
@@ -368,15 +392,20 @@ impl Source {
             self.base,
             percent_encode(&filters)
         );
-        let mut wait = Duration::from_secs(1);
+        let mut wait = self.retry.first_wait;
         let mut attempt = 0;
         loop {
             attempt += 1;
             match self.get(&url).await {
                 Ok(body) => return Ok(body),
-                Err(e) if attempt < 5 && retryable(&e) => {
+                Err(e) if attempt < self.retry.attempts && retryable(&e) => {
+                    eprintln!(
+                        "retry         minute {offset} of {date} in {wait:?}, attempt {} of {}: {e}",
+                        attempt + 1,
+                        self.retry.attempts
+                    );
                     tokio::time::sleep(wait).await;
-                    wait *= 2;
+                    wait = (wait * 2).min(self.retry.max_wait);
                 }
                 Err(e) => return Err(e),
             }
@@ -442,10 +471,14 @@ impl fmt::Display for ImportReport {
 }
 
 /// Import one day: download it slice by slice, write the frames as the recorder would
-/// (hourly files, compressed when done), then derive and verify the day's tables.
+/// (hourly files, compressed when done), then derive and verify the day's tables. If the
+/// download fails, the frames written so far are removed, so that the day can be imported
+/// again from scratch.
+#[allow(clippy::too_many_arguments)]
 pub fn tardis_day(
     base: &str,
     key: Option<String>,
+    retry: Retry,
     date: &str,
     symbol: &str,
     out: &Path,
@@ -461,7 +494,41 @@ pub fn tardis_day(
     if frames_dir.is_dir() && fs::read_dir(&frames_dir)?.next().is_some() {
         return Err(ImportError::Exists(day));
     }
-    let src = Source::new(base, key)?;
+    let src = Source::new(base, key, retry)?;
+    let (stats, files) = match download(&src, date, symbol, &root, &steps) {
+        Ok(done) => done,
+        Err(e) => {
+            // the directory held no frames before: everything in it is from this attempt
+            let _ = fs::remove_dir_all(&frames_dir);
+            if fs::read_dir(&day).is_ok_and(|mut d| d.next().is_none()) {
+                let _ = fs::remove_dir(&day);
+            }
+            return Err(e);
+        }
+    };
+    let (mut raw, mut packed) = (0, 0);
+    for f in &files {
+        let c = compress_file(f, LEVEL)?;
+        raw += c.raw_bytes;
+        packed += c.compressed_bytes;
+    }
+    let rebuilt = rebuild_day(&day, allow_today).map_err(ImportError::Rebuild)?;
+    Ok(ImportReport {
+        stats,
+        files: files.len(),
+        raw_bytes: raw,
+        compressed_bytes: packed,
+        rebuilt,
+    })
+}
+
+fn download(
+    src: &Source,
+    date: &str,
+    symbol: &str,
+    root: &Path,
+    steps: &(String, String),
+) -> Result<(ImportStats, Vec<std::path::PathBuf>), ImportError> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -471,7 +538,7 @@ pub fn tardis_day(
     let mut write = |f: OwnedFrame, unit: TimeUnit| -> io::Result<()> {
         let r = rot.get_or_insert_with(|| {
             Rotator::new(
-                &root,
+                root,
                 Header {
                     symbol: symbol.to_owned(),
                     price_step: steps.0.clone(),
@@ -495,21 +562,7 @@ pub fn tardis_day(
     let Some(rot) = rot else {
         return Err(ImportError::NoData);
     };
-    let files = rot.finish()?;
-    let (mut raw, mut packed) = (0, 0);
-    for f in &files {
-        let c = compress_file(f, LEVEL)?;
-        raw += c.raw_bytes;
-        packed += c.compressed_bytes;
-    }
-    let rebuilt = rebuild_day(&day, allow_today).map_err(ImportError::Rebuild)?;
-    Ok(ImportReport {
-        stats: conv.stats,
-        files: files.len(),
-        raw_bytes: raw,
-        compressed_bytes: packed,
-        rebuilt,
-    })
+    Ok((conv.stats, rot.finish()?))
 }
 
 fn retryable(e: &ImportError) -> bool {
@@ -698,7 +751,20 @@ mod tests {
 
     /// A stand-in for the raw API: the body for minute offset 0 (zstd, two frames, as the
     /// API sends one per minute), an empty body for the others; or one status for all.
+    fn quick() -> Retry {
+        Retry {
+            attempts: 3,
+            first_wait: Duration::from_millis(1),
+            max_wait: Duration::from_millis(2),
+        }
+    }
+
     fn serve(body: Vec<u8>, status: u16) -> (String, Arc<Mutex<Vec<String>>>) {
+        serve_then(body, status, status)
+    }
+
+    /// `first` for the request of minute offset 0, `later` for all the others.
+    fn serve_then(body: Vec<u8>, first: u16, later: u16) -> (String, Arc<Mutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -724,9 +790,14 @@ mod tests {
                 }
                 let req = String::from_utf8_lossy(&req).into_owned();
                 log.lock().unwrap().push(req.clone());
-                let first = req.contains("offset=0&");
-                let payload: &[u8] = if status == 200 && first { &packed } else { b"" };
-                let enc = if status == 200 && first {
+                let is_first = req.contains("offset=0&");
+                let status = if is_first { first } else { later };
+                let payload: &[u8] = if status == 200 && is_first {
+                    &packed
+                } else {
+                    b""
+                };
+                let enc = if status == 200 && is_first {
                     "Content-Encoding: zstd\r\n"
                 } else {
                     ""
@@ -751,6 +822,7 @@ mod tests {
         let r = tardis_day(
             &base,
             None,
+            quick(),
             "2026-11-21",
             "BTCUSDT",
             dir.path(),
@@ -795,6 +867,7 @@ mod tests {
         let again = tardis_day(
             &base,
             None,
+            quick(),
             "2026-11-21",
             "BTCUSDT",
             dir.path(),
@@ -832,6 +905,7 @@ mod tests {
         let r = tardis_day(
             &base,
             None,
+            quick(),
             "2026-11-21",
             "BTCUSDT",
             dir.path(),
@@ -848,6 +922,46 @@ mod tests {
     }
 
     #[test]
+    fn a_download_that_fails_leaves_no_frames_and_can_be_done_again() {
+        let s = session();
+        let text = tardis_lines(&s, true).into_bytes();
+        let (base, seen) = serve_then(text.clone(), 200, 503);
+        let dir = tempfile::tempdir().unwrap();
+        let steps = ("0.01000000".to_owned(), "0.00001000".to_owned());
+        let err = tardis_day(
+            &base,
+            None,
+            quick(),
+            "2026-11-21",
+            "BTCUSDT",
+            dir.path(),
+            steps.clone(),
+            true,
+        );
+        assert!(matches!(err, Err(ImportError::Status { code: 503, .. })));
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1 + 3,
+            "the first slice, then three tries of the second"
+        );
+        let day = dir.path().join("binance/BTCUSDT/2026-11-21");
+        assert!(!day.exists(), "nothing left of the attempt");
+        let (base, _) = serve(text, 200);
+        let r = tardis_day(
+            &base,
+            None,
+            quick(),
+            "2026-11-21",
+            "BTCUSDT",
+            dir.path(),
+            steps,
+            true,
+        )
+        .unwrap();
+        assert_ne!(r.rebuilt.verify.outcome(), Outcome::Fail);
+    }
+
+    #[test]
     fn a_refusal_names_the_key() {
         let (base, _) = serve(Vec::new(), 401);
         let dir = tempfile::tempdir().unwrap();
@@ -855,6 +969,7 @@ mod tests {
         let err = tardis_day(
             &base,
             None,
+            quick(),
             "2026-11-02",
             "BTCUSDT",
             dir.path(),
