@@ -145,7 +145,8 @@ cargo run --release -- import tardis --date 2026-11-01 --symbol BTCUSDT --out da
 
 - Each message becomes a text frame byte for byte, with Tardis's receive time. An empty
   line in their data, a lost connection, closes one connection and opens the next; the
-  end of the day closes the last with reason `stopped`.
+  end of the day closes the last with reason `stopped`, one nanosecond after its last
+  message.
 - Their snapshot of a connection becomes the answer to the request our pipeline makes for
   it, which the connection's first depth update causes. A snapshot received before that
   update follows it one nanosecond later. Our book synchronization then checks it like

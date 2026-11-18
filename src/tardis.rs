@@ -11,7 +11,8 @@
 //! - Each message becomes a text frame byte for byte, with Tardis's receive time. Times are
 //!   kept in order: a line older than the one before it gets the time of the one before.
 //! - The start, and each empty line, open a connection: `connected` (and `disconnected` for
-//!   the one before). The end of the day closes the last one with reason `stopped`.
+//!   the one before). The end of the day closes the last one with reason `stopped`. A
+//!   connection ends one nanosecond after its last message, as a live one ends after it.
 //! - A snapshot becomes the answer to the request the pipeline makes for that connection,
 //!   which the first depth update after the connection causes (its request ID is that
 //!   update's receive time, `docs/FRAMES.md`). A snapshot received before any update waits
@@ -204,8 +205,7 @@ impl Converter {
         let line = line.trim_end_matches(['\r', '\n']);
         if line.trim().is_empty() {
             if self.connected {
-                let ts = self.last_ts;
-                self.close(ts, "tardis.dev: connection lost");
+                self.close("tardis.dev: connection lost");
             }
             return self.flush(out);
         }
@@ -272,8 +272,7 @@ impl Converter {
         out: &mut impl FnMut(OwnedFrame, TimeUnit) -> io::Result<()>,
     ) -> Result<(), ImportError> {
         if self.connected {
-            let ts = self.last_ts;
-            self.close(ts, crate::net::ws::STOPPED);
+            self.close(crate::net::ws::STOPPED);
         }
         if self.time_unit.is_none() && !self.pending.is_empty() {
             self.time_unit = Some(TimeUnit::Micro); // no event time seen: nothing depends on it
@@ -281,7 +280,10 @@ impl Converter {
         self.flush(out)
     }
 
-    fn close(&mut self, ts: i64, reason: &str) {
+    /// A connection ends after its last message: one nanosecond later, so that nothing
+    /// derived from that message (a book sample taken at it) falls after the end.
+    fn close(&mut self, reason: &str) {
+        let ts = self.last_ts + 1;
         self.emit(
             FrameKind::Disconnected,
             ts,
@@ -800,6 +802,49 @@ mod tests {
             true,
         );
         assert!(matches!(again, Err(ImportError::Exists(_))));
+    }
+
+    #[test]
+    fn the_day_ends_after_its_last_message_even_when_that_message_starts_a_book_sample() {
+        // the last line opens a new 100 ms of receive time, so the pipeline samples the book
+        // at it; the stop must come after that sample, not at the same time
+        let s = session();
+        let last = s.frames.last().unwrap().recv_ts;
+        let at = (last / (100 * MS) + 1) * (100 * MS) + 7;
+        let trade = format!(
+            r#"{} {{"stream":"btcusdt@trade","data":{{"e":"trade","E":{e},"s":"BTCUSDT","t":999999,"p":"100.00000000","q":"0.00100000","T":{e},"m":true,"M":true}}}}"#,
+            iso(at),
+            e = at / 1000
+        );
+        let mut text = tardis_lines(&s, true);
+        text.push_str(&trade);
+        text.push('\n');
+        let (frames, _) = convert(&text);
+        let stop = frames.last().unwrap();
+        assert_eq!(stop.kind, FrameKind::Disconnected);
+        assert!(
+            stop.recv_ts > frames[frames.len() - 2].recv_ts,
+            "the stop follows the last message"
+        );
+        let (base, _) = serve(text.into_bytes(), 200);
+        let dir = tempfile::tempdir().unwrap();
+        let steps = ("0.01000000".to_owned(), "0.00001000".to_owned());
+        let r = tardis_day(
+            &base,
+            None,
+            "2026-11-21",
+            "BTCUSDT",
+            dir.path(),
+            steps,
+            true,
+        )
+        .unwrap();
+        assert_ne!(
+            r.rebuilt.verify.outcome(),
+            Outcome::Fail,
+            "{}",
+            r.rebuilt.verify
+        );
     }
 
     #[test]
