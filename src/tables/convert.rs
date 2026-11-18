@@ -115,12 +115,13 @@ impl fmt::Display for ConvertSummary {
         }
         writeln!(
             f,
-            "rows          {} depth diffs, {} book tickers, {} trades",
+            "rows          {} depth updates, {} best bid and ask updates, {} trades",
             s.depth, s.book_tickers, s.trades
         )?;
         writeln!(
             f,
-            "continuity    {} gaps, {} resyncs, {} reconnects; valid book {:.1}% of the time",
+            "continuity    {} gaps, {} resyncs, {} reconnects; valid book {:.1}% of the time \
+             from the first frame to the last",
             s.gaps,
             s.resyncs,
             s.reconnects,

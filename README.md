@@ -64,8 +64,8 @@ cargo run -- convert --input tests/fixtures/gap.jsonl --out /tmp/demo
 
 ```text
 converted     1 file, 9 frames of BTCUSDT
-rows          5 depth diffs, 1 book tickers, 0 trades
-continuity    1 gaps, 1 resyncs, 0 reconnects; valid book 42.0% of the time
+rows          5 depth updates, 1 best bid and ask updates, 0 trades
+continuity    1 gaps, 1 resyncs, 0 reconnects; valid book 42.0% of the time from the first frame to the last
 written       5 files
 ```
 
@@ -106,6 +106,7 @@ result      PASS
 | `verify` | check a recorded day: manifest against files, continuity of the update stream re-checked from the tables alone, freshness, and a rebuild of every table from the frames compared row for row; exit 1 on failure | implemented |
 | `bench` | measure the decode path on a recorded day: the decoder per kind of message, the whole pipeline with each book (throughput, time per frame, allocations per frame), the book updates alone | implemented |
 | `rebuild` | derive a recorded day's tables again from its frames, in place, and verify it: after a crash, or when the rules of derivation have changed | implemented |
+| `import tardis` | a day of Tardis.dev's raw Binance Spot recording, written as frames and derived into tables like a recording of our own (below) | implemented |
 
 ## What is implemented
 
@@ -129,6 +130,31 @@ result      PASS
 | Benchmark of the decode path and a counting allocator (per thread, installed in the binary and the unit tests): decoding and the pipeline allocate nothing per frame once their buffers have grown; with the ladder book a frame costs no allocation at all, the reference book allocates a tree node for each new price level | `src/bench.rs`, `src/alloc_count.rs` | a test asserts zero allocations over thousands of frames with late intervals and probes; `bench` on a recorded day reports every stage and checks that both books end identical |
 | Operation: free space on the data disk checked before the start and with every status line, with a clean stop and exit code 3 below the limit; systemd units for a recorder per symbol (restart on failure but not on a full disk, hardened) and a nightly `verify` of the day before | `src/record/disk.rs`, `deploy/` | a recording refused on a full disk writes nothing; a disk that fills during a recording stops it early and cleanly, and its day passes `verify`; units checked with `systemd-analyze verify` |
 | Recorder: network, decode and writer threads joined by never-blocking SPSC queues (a full queue drops frames and leaves an `overflow` marker); snapshot requests answered by REST with pacing, `Retry-After` and weight limits; hourly frames files; the writer derives the tables from what it stores; clean stop on Ctrl+C or SIGTERM | `src/record/` | end-to-end test against local servers: a live run and the replay of its files give identical counters, and its tables equal `convert` of its files |
+
+## Days recorded by Tardis.dev
+
+Tardis.dev records the same Binance Spot streams (`depth@100ms`, `bookTicker`, `trade`, in
+microseconds since 2025-02-28) and the REST depth snapshots it fetches, from Tokyo, and
+serves the first day of each month without a key. `marketrec import tardis` turns such a
+day into frames and from there into the same tables, so that everything downstream,
+`verify` and the research side included, reads it like a day of our own:
+
+```bash
+cargo run --release -- import tardis --date 2026-11-01 --symbol BTCUSDT --out data
+```
+
+- Each message becomes a text frame byte for byte, with Tardis's receive time. An empty
+  line in their data, a lost connection, closes one connection and opens the next; the
+  end of the day closes the last with reason `stopped`.
+- Their snapshot of a connection becomes the answer to the request our pipeline makes for
+  it, which the connection's first depth update causes. A snapshot received before that
+  update follows it one nanosecond later. Our book synchronization then checks it like
+  any other: a snapshot that does not fit the updates is reported, not forced.
+- The steps come from Binance's current rules unless `--price-step` and `--qty-step` are
+  given. Other days need a key, read from the environment variable `TARDIS_API_KEY`.
+- The receive times are theirs: the lag in the manifest is that of a machine in Tokyo, and
+  there are no round trips of a link of ours. The raw data stays in `data/`, which is not
+  part of the repository.
 
 ## Running 24/7
 

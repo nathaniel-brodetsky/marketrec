@@ -15,6 +15,7 @@ pub mod record;
 pub mod replay;
 pub mod sync;
 pub mod tables;
+pub mod tardis;
 #[cfg(test)]
 pub(crate) mod testkit;
 pub mod time;

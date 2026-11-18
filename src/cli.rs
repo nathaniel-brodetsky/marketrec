@@ -108,10 +108,43 @@ pub enum Command {
         #[arg(long, default_value = crate::net::ws::DEFAULT_BASE)]
         ws_url: String,
     },
+    /// Bring in a day recorded by someone else, as frames, and derive its tables.
+    Import {
+        #[command(subcommand)]
+        source: ImportSource,
+    },
     /// Convert frames files between the binary form and readable JSON Lines.
     Frames {
         #[command(subcommand)]
         action: FramesAction,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum ImportSource {
+    /// A day of Tardis.dev's raw Binance Spot recording: depth updates, best bid and ask,
+    /// trades and its depth snapshots. The first day of each month needs no key; for other
+    /// days the key is read from the environment variable TARDIS_API_KEY.
+    Tardis {
+        /// UTC date, for example 2026-11-01.
+        #[arg(long)]
+        date: String,
+        #[arg(long, default_value = "BTCUSDT")]
+        symbol: String,
+        /// Root of the data directory.
+        #[arg(long, default_value = "data")]
+        out: PathBuf,
+        /// Tick size, for example 0.01000000; with --qty-step. Taken from Binance's current
+        /// rules if both are left out.
+        #[arg(long, requires = "qty_step")]
+        price_step: Option<String>,
+        /// Step size, for example 0.00001000; with --price-step.
+        #[arg(long, requires = "price_step")]
+        qty_step: Option<String>,
+        #[arg(long, default_value = crate::tardis::DEFAULT_BASE)]
+        tardis_url: String,
+        #[arg(long, default_value = crate::net::rest::DEFAULT_BASE)]
+        rest_url: String,
     },
 }
 
@@ -197,6 +230,7 @@ pub enum CliError {
     Convert(crate::tables::convert::ConvertError),
     Bench(crate::bench::BenchError),
     Rebuild(crate::rebuild::RebuildError),
+    Import(crate::tardis::ImportError),
     /// The input contains a damaged record; everything before it was processed.
     Damaged,
     /// `verify` found a failing check; the report says which.
@@ -218,6 +252,7 @@ impl fmt::Display for CliError {
             CliError::Convert(e) => write!(f, "{e}"),
             CliError::Bench(e) => write!(f, "{e}"),
             CliError::Rebuild(e) => write!(f, "{e}"),
+            CliError::Import(e) => write!(f, "{e}"),
             CliError::Damaged => write!(f, "the input contains a damaged record"),
             CliError::VerifyFailed => write!(f, "verification failed"),
             CliError::LowDisk(m) => write!(f, "{m}"),
@@ -286,6 +321,38 @@ pub fn run(command: Command) -> Result<(), CliError> {
             Ok(())
         }
         Command::Frames { action } => run_frames(action),
+        Command::Import {
+            source:
+                ImportSource::Tardis {
+                    date,
+                    symbol,
+                    out,
+                    price_step,
+                    qty_step,
+                    tardis_url,
+                    rest_url,
+                },
+        } => {
+            let steps = match (price_step, qty_step) {
+                (Some(p), Some(q)) => (p, q),
+                _ => {
+                    let info = block_on(rest(&rest_url)?.symbol_info(&symbol))?;
+                    eprintln!(
+                        "steps         {} and {}, Binance's current rules for {symbol}",
+                        info.tick_size, info.step_size
+                    );
+                    (info.tick_size, info.step_size)
+                }
+            };
+            let key = std::env::var("TARDIS_API_KEY").ok();
+            let r = crate::tardis::tardis_day(&tardis_url, key, &date, &symbol, &out, steps, false)
+                .map_err(CliError::Import)?;
+            println!("{r}");
+            if r.rebuilt.verify.outcome() == crate::verify::Outcome::Fail {
+                return Err(CliError::VerifyFailed);
+            }
+            Ok(())
+        }
         Command::Info { symbol, rest_url } => {
             let info = block_on(rest(&rest_url)?.symbol_info(&symbol))?;
             println!(
