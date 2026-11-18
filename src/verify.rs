@@ -13,6 +13,11 @@
 //!   stream has reached.
 //! - `freshness`: how late the depth updates arrived after their exchange time, and the
 //!   intervals in which the data was more than a second behind (a valid but stale book).
+//! - `usable`: how much of the day is usable. Messages the decoder could not read are
+//!   missing from the tables and break the book until the next snapshot; a day with them, or
+//!   with a valid book for less than 90% of its connected time, is a warning. The other
+//!   checks can all pass on such a day: they check that the tables follow from the frames,
+//!   not that the frames make a good day.
 //! - `rebuild`: the tables built again from the frames (this day's and the day before's)
 //!   equal the stored ones row for row.
 
@@ -137,6 +142,7 @@ pub fn verify_day(day: &Path, opts: &VerifyOptions) -> VerifyReport {
     check_hours(day, &m, &mut report);
     check_continuity(day, &m, &mut report);
     check_freshness(day, &m, &mut report);
+    check_usable(day, &m, &mut report);
     if !opts.quick {
         check_rebuild(day, &m, &found, opts, &mut report);
     }
@@ -522,16 +528,7 @@ fn continuity(day: &Path, m: &DayManifest) -> Result<(Outcome, String), String> 
     let mut wrong_id: Vec<String> = Vec::new();
     let mut unsound: Vec<String> = Vec::new();
     let mut unreadable: Vec<String> = Vec::new();
-    let at = |ts: i64| {
-        let t = Utc::from_ns(ts);
-        format!(
-            "{:02}:{:02}:{:02}.{:09}",
-            t.hour,
-            t.minute,
-            t.second,
-            ts.rem_euclid(1_000_000_000)
-        )
-    };
+    let at = clock;
     for (ts, step) in line {
         match step {
             Step::RunStart(i) => match runs[i].book_at_start {
@@ -702,6 +699,70 @@ fn diagnose(inside: &MsHistogram, outside: &MsHistogram) -> String {
         None => line += "; no probe outside them to compare with",
     }
     line
+}
+
+/// `13:05:12.123456789`
+fn clock(ts: i64) -> String {
+    let t = Utc::from_ns(ts);
+    format!(
+        "{:02}:{:02}:{:02}.{:09}",
+        t.hour,
+        t.minute,
+        t.second,
+        ts.rem_euclid(1_000_000_000)
+    )
+}
+
+/// Below this share of connected time with a valid book, a day is a warning.
+const MIN_VALID_SHARE: f64 = 0.9;
+
+fn check_usable(day: &Path, m: &DayManifest, report: &mut VerifyReport) {
+    let mut outcome = Outcome::Pass;
+    let undecodable = m.quality.get("undecodable").copied().unwrap_or(0);
+    let mut detail = if undecodable == 0 {
+        "every message decoded".to_owned()
+    } else {
+        outcome = Outcome::Warn;
+        let first = match first_quality(day, m, "undecodable") {
+            Ok(Some((ts, detail))) => format!(", the first at {}: {detail}", clock(ts)),
+            Ok(None) => String::new(),
+            Err(e) => format!(", the first not read: {e}"),
+        };
+        format!(
+            "{undecodable} message{} could not be decoded{first}\nthey are missing from the tables, and each breaks the book until the next snapshot; a price or quantity off the steps means the steps are coarser than the data (an import takes --price-step and --qty-step)",
+            if undecodable == 1 { "" } else { "s" }
+        )
+    };
+    let share = format!(
+        "valid book {:.2}% of connected time",
+        m.synced_share * 100.0
+    );
+    if m.covered_ns > 0 && m.synced_share < MIN_VALID_SHARE {
+        outcome = Outcome::Warn;
+        detail += &format!(
+            "\n{share}, below {:.0}%: the research side gets only that part of the day",
+            MIN_VALID_SHARE * 100.0
+        );
+    } else {
+        detail = format!("{share}; {detail}");
+    }
+    report.push("usable", outcome, detail);
+}
+
+/// Time and detail of the first quality event of `kind`.
+fn first_quality(day: &Path, m: &DayManifest, kind: &str) -> Result<Option<(i64, String)>, String> {
+    for batch in TableStream::new(Table::Quality, listed(day, m, Table::Quality), None) {
+        let batch = batch.map_err(|e| e.to_string())?;
+        let (kinds, details) = (
+            batch.column(1).as_string::<i32>(),
+            batch.column(2).as_string::<i32>(),
+        );
+        let ts = i64_col(&batch, 0);
+        if let Some(i) = (0..batch.num_rows()).find(|&i| kinds.value(i) == kind) {
+            return Ok(Some((ts[i], details.value(i).to_owned())));
+        }
+    }
+    Ok(None)
 }
 
 fn check_freshness(day: &Path, m: &DayManifest, report: &mut VerifyReport) {
@@ -1062,7 +1123,7 @@ mod tests {
         for date in ["2026-11-21", "2026-11-22"] {
             let r = verify_day(&root.join(date), &VerifyOptions::default());
             assert_eq!(r.outcome(), Outcome::Pass, "{date}\n{r}");
-            assert_eq!(r.checks.len(), 7);
+            assert_eq!(r.checks.len(), 8);
         }
         let r = verify_day(&root.join("2026-11-22"), &VerifyOptions::default());
         let c = &r.check("continuity").unwrap().detail;
@@ -1077,6 +1138,103 @@ mod tests {
                 .contains("from the day's 1 frames file and 1 frames file of the day before"),
             "{r}"
         );
+    }
+
+    #[test]
+    fn a_message_off_the_steps_is_a_warning_that_says_how_much_of_the_day_is_lost() {
+        // a level quantity finer than the quantity step: the decoder drops the message, the
+        // next one shows a gap, and no snapshot answers (as in a Tardis.dev day, which has
+        // one): the other checks pass, as the tables do follow from the frames
+        let t0 = DAY0 + NS_PER_HOUR;
+        let mut s = Session::new(23);
+        s.connect(t0);
+        s.run(t0 + MS, t0 + 2 * MIN, 40 * MS);
+        s.disconnect(t0 + 2 * MIN, STOPPED);
+        let mut frames = s.frames.clone();
+        let late = t0 + 30 * SEC;
+        let f = frames
+            .iter_mut()
+            .find(|f| {
+                f.recv_ts > late
+                    && f.kind == crate::frames::FrameKind::Text
+                    && f.payload.windows(7).any(|w| w == b"\"b\":[[\"")
+            })
+            .unwrap();
+        let text = String::from_utf8(f.payload.clone()).unwrap();
+        let q = text.find(r#""b":[[""#).unwrap() + 7;
+        let q = q + text[q..].find(r#"",""#).unwrap() + 3;
+        let end = q + text[q..].find('"').unwrap();
+        f.payload = format!("{}0.00000001{}", &text[..q], &text[end..]).into_bytes();
+        let at = f.recv_ts;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("binance/BTCUSDT");
+        record(&frames, &root, true);
+        let r = verify_day(&root.join("2026-11-21"), &VerifyOptions::default());
+        let usable = r.check("usable").unwrap();
+        assert_eq!(usable.outcome, Outcome::Warn, "{r}");
+        assert!(
+            r.checks
+                .iter()
+                .filter(|c| c.name != "usable")
+                .all(|c| c.outcome == Outcome::Pass),
+            "{r}"
+        );
+        let d = &usable.detail;
+        assert!(
+            d.starts_with(&format!(
+                "1 message could not be decoded, the first at {}: ",
+                clock(at)
+            )),
+            "{d}"
+        );
+        assert!(d.contains("not a whole number of steps"), "{d}");
+        assert!(d.contains("--qty-step"), "{d}");
+        assert!(
+            d.contains("valid book 25.0") && d.contains("below 90%"),
+            "valid from the start to the dropped message, a quarter of the run: {d}"
+        );
+    }
+
+    #[test]
+    fn either_undecodable_messages_or_a_short_valid_book_is_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("binance/BTCUSDT");
+        record(&two_days().frames, &root, true);
+        let day = root.join("2026-11-22");
+        let usable = |day: &Path| verify_day(day, &quick()).check("usable").cloned().unwrap();
+        let clean = usable(&day);
+        assert_eq!(clean.outcome, Outcome::Pass);
+        assert!(
+            clean
+                .detail
+                .ends_with("of connected time; every message decoded"),
+            "{}",
+            clean.detail
+        );
+        set_manifest(&day, |m| {
+            m.quality.insert("undecodable".into(), 2);
+        });
+        let c = usable(&day);
+        assert_eq!(c.outcome, Outcome::Warn, "even with the book valid");
+        assert!(
+            c.detail.contains("2 messages could not be decoded"),
+            "{}",
+            c.detail
+        );
+        set_manifest(&day, |m| {
+            m.quality.remove("undecodable");
+            m.synced_share = 0.89;
+        });
+        let c = usable(&day);
+        assert_eq!(c.outcome, Outcome::Warn);
+        assert!(
+            c.detail
+                .contains("valid book 89.00% of connected time, below 90%"),
+            "{}",
+            c.detail
+        );
+        set_manifest(&day, |m| m.synced_share = 0.9);
+        assert_eq!(usable(&day).outcome, Outcome::Pass, "90% is enough");
     }
 
     #[test]

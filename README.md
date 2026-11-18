@@ -83,13 +83,19 @@ cargo run -- verify --day /tmp/demo/binance/BTCUSDT/2026-11-21
 day         /tmp/demo/binance/BTCUSDT/2026-11-21
 PASS manifest   BTCUSDT 2026-11-21, schema 1, steps 0.01000000 and 0.00001000, 1 run, valid book 42.0% of connected time
 PASS parts      4 parts, all listed in the manifest, readable, with the schema, symbol and steps it names
-PASS rows       depth_diff 5, book_ticker 1, trades 0, book_l20 4, quality 4
+PASS rows       depth_diff 5, book_ticker 1, trades 0, book_l20 4, quality 4, link_rtt 0
 PASS hours      every part holds one hour of this day, receive times in order
 PASS continuity 2 updates continue the book in 2 valid intervals (1 gap recorded, none missed, 0 already applied); 4 book rows agree with the updates
 PASS freshness  depth updates arrived p50 2 ms, p99 2 ms, max 2 ms after their exchange time
+WARN usable     every message decoded
+                valid book 41.98% of connected time, below 90%: the research side gets only that part of the day
 PASS rebuild    every table rebuilt from the day's 1 frames file is identical, row for row
-result      PASS
+result      WARN
 ```
+
+The demo's book is valid for less than half of its connected time, hence the warning.
+`usable` says whether a day is worth having; the other checks say that its tables follow
+from its frames, and they pass on a day whose book was invalid from the first minute.
 
 ## Commands
 
@@ -103,7 +109,7 @@ result      PASS
 | `listen` | connect to the live stream for a while and count messages per stream; records nothing | implemented |
 | `record` | record a symbol from Binance into hourly frames files and Parquet tables until Ctrl+C, with status lines and quality events | implemented (JSON feed) |
 | `convert` | build the Parquet tables from frames files, exactly as `record` does live | implemented |
-| `verify` | check a recorded day: manifest against files, continuity of the update stream re-checked from the tables alone, freshness, and a rebuild of every table from the frames compared row for row; exit 1 on failure | implemented |
+| `verify` | check a recorded day: manifest against files, continuity of the update stream re-checked from the tables alone, freshness, how much of the day is usable (undecodable messages, share of valid book), and a rebuild of every table from the frames compared row for row; exit 1 on failure | implemented |
 | `bench` | measure the decode path on a recorded day: the decoder per kind of message, the whole pipeline with each book (throughput, time per frame, allocations per frame), the book updates alone | implemented |
 | `rebuild` | derive a recorded day's tables again from its frames, in place, and verify it: after a crash, or when the rules of derivation have changed | implemented |
 | `import tardis` | a day of Tardis.dev's raw Binance Spot recording, written as frames and derived into tables like a recording of our own (below) | implemented |
@@ -157,7 +163,11 @@ cargo run --release -- import tardis --date 2026-11-01 --symbol BTCUSDT --out da
   download fails anyway, the frames written so far are removed, so the day can simply be
   imported again.
 - The steps come from Binance's current rules unless `--price-step` and `--qty-step` are
-  given. Other days need a key, read from the environment variable `TARDIS_API_KEY`.
+  given. Older days can hold quantities finer than today's step (orders left from a time
+  with a finer one): a message with one cannot be decoded, and since Tardis.dev has one
+  snapshot a day, the book stays invalid from there to midnight; `verify` warns under
+  `usable`. Binance writes quantities with eight decimals, so `--qty-step 0.00000001`
+  reads every day; BTCUSDT's days from 2025-03 to 2026-01 need it. Other days need a key, read from the environment variable `TARDIS_API_KEY`.
 - The receive times are theirs: the lag in the manifest is that of a machine in Tokyo, and
   there are no round trips of a link of ours. The raw data stays in `data/`, which is not
   part of the repository.
