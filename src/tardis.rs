@@ -8,8 +8,9 @@
 //! a lost connection. The first day of each month is served without a key; for other days
 //! the key is read from `TARDIS_API_KEY`.
 //!
-//! - Each message becomes a text frame byte for byte, with Tardis's receive time. Times are
-//!   kept in order: a line older than the one before it gets the time of the one before.
+//! - Each message becomes a text frame byte for byte, with Tardis's receive time. Every frame
+//!   gets a time of its own: a line received at the same time as the one before it, or
+//!   earlier, gets one nanosecond after it.
 //! - The start, and each empty line, open a connection: `connected` (and `disconnected` for
 //!   the one before). The end of the day closes the last one with reason `stopped`. A
 //!   connection ends one nanosecond after its last message, as a live one ends after it.
@@ -217,7 +218,6 @@ impl Converter {
         };
         let (time, message) = line.split_once(' ').ok_or_else(|| bad("no time"))?;
         let ts = parse_time(time).ok_or_else(|| bad("time is not ISO 8601 UTC"))?;
-        let ts = ts.max(self.last_ts);
         let env: Envelope = serde_json::from_str(message)
             .map_err(|e| bad(&format!("not a combined-stream message: {e}")))?;
         let Some(name) = env.stream.strip_prefix(&self.stream_prefix) else {
@@ -230,7 +230,7 @@ impl Converter {
             self.connected = true;
             self.first_depth = None;
             self.held = None;
-            self.emit(
+            let _ = self.emit(
                 FrameKind::Connected,
                 ts,
                 self.conn,
@@ -250,16 +250,18 @@ impl Converter {
             self.stats.snapshots += 1;
             let body = env.data.get().as_bytes().to_vec();
             match self.first_depth {
-                Some(id) => self.emit(FrameKind::Snapshot, ts, id as u64, body),
+                Some(id) => {
+                    self.emit(FrameKind::Snapshot, ts, id as u64, body);
+                }
                 None => self.held = Some(body),
             }
         } else if name.starts_with("depth") || name == "bookTicker" || name == "trade" {
             self.stats.messages += 1;
-            self.emit(FrameKind::Text, ts, self.conn, message.as_bytes().to_vec());
+            let at = self.emit(FrameKind::Text, ts, self.conn, message.as_bytes().to_vec());
             if name.starts_with("depth") && self.first_depth.is_none() {
-                self.first_depth = Some(ts);
+                self.first_depth = Some(at);
                 if let Some(body) = self.held.take() {
-                    self.emit(FrameKind::Snapshot, ts + 1, ts as u64, body);
+                    self.emit(FrameKind::Snapshot, at + 1, at as u64, body);
                 }
             }
         } else {
@@ -295,14 +297,19 @@ impl Converter {
         self.connected = false;
     }
 
-    fn emit(&mut self, kind: FrameKind, ts: i64, aux: u64, payload: Vec<u8>) {
-        self.last_ts = self.last_ts.max(ts);
+    /// Queue a frame at `ts`, or one nanosecond after the frame before if that is later, and
+    /// return the time it got. Every frame gets a time of its own, as in a live recording:
+    /// the tables tell the book's state by receive time, and two frames at one time would
+    /// make a book sample taken between them ambiguous.
+    fn emit(&mut self, kind: FrameKind, ts: i64, aux: u64, payload: Vec<u8>) -> i64 {
+        self.last_ts = ts.max(self.last_ts.saturating_add(1));
         self.pending.push(OwnedFrame {
             kind,
             recv_ts: self.last_ts,
             aux,
             payload,
         });
+        self.last_ts
     }
 
     fn flush(
@@ -959,6 +966,56 @@ mod tests {
         )
         .unwrap();
         assert_ne!(r.rebuilt.verify.outcome(), Outcome::Fail);
+    }
+
+    /// Lines that share a receive time, as Tardis.dev's data has where messages arrived
+    /// together: here every depth update gets the time of the line before it.
+    fn crowded(text: &str) -> String {
+        let mut out = String::new();
+        let mut prev_time = None::<String>;
+        for line in text.lines() {
+            match (line.split_once(' '), &prev_time) {
+                (Some((_, msg)), Some(t)) if msg.contains("@depth@") => {
+                    out += &format!("{t} {msg}\n");
+                }
+                (Some((t, _)), _) => {
+                    prev_time = Some(t.to_owned());
+                    out += &format!("{line}\n");
+                }
+                (None, _) => out += &format!("{line}\n"),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn messages_received_together_still_get_times_of_their_own() {
+        let text = crowded(&tardis_lines(&session(), true));
+        let (frames, _) = convert(&text);
+        assert!(
+            frames.windows(2).all(|w| w[0].recv_ts < w[1].recv_ts),
+            "every frame later than the one before"
+        );
+        let (base, _) = serve(text.into_bytes(), 200);
+        let dir = tempfile::tempdir().unwrap();
+        let steps = ("0.01000000".to_owned(), "0.00001000".to_owned());
+        let r = tardis_day(
+            &base,
+            None,
+            quick(),
+            "2026-11-21",
+            "BTCUSDT",
+            dir.path(),
+            steps,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            r.rebuilt.verify.check("continuity").unwrap().outcome,
+            Outcome::Pass,
+            "{}",
+            r.rebuilt.verify
+        );
     }
 
     #[test]

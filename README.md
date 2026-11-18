@@ -143,7 +143,9 @@ day into frames and from there into the same tables, so that everything downstre
 cargo run --release -- import tardis --date 2026-11-01 --symbol BTCUSDT --out data
 ```
 
-- Each message becomes a text frame byte for byte, with Tardis's receive time. An empty
+- Each message becomes a text frame byte for byte, with Tardis's receive time; messages
+  they received at the same time are spread one nanosecond apart, so that every frame has
+  a time of its own as in a recording of ours. An empty
   line in their data, a lost connection, closes one connection and opens the next; the
   end of the day closes the last with reason `stopped`, one nanosecond after its last
   message.
